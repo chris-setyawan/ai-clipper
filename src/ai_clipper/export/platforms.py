@@ -58,6 +58,9 @@ class Platform:
         return {
             "bottom_margin_frac": min(0.45, self.bottom_ui + headroom),
             "side_margin_frac": min(0.30, max(self.left_ui, self.right_ui) + headroom),
+            # the title hangs from the top, so it clears a different piece of
+            # interface than the captions do
+            "title_top_margin_frac": min(0.35, self.top_ui + headroom),
         }
 
     def fits(self, duration: float) -> bool:

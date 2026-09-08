@@ -112,9 +112,11 @@ nothing - and a file already downloaded is reused instead of fetched again.
 
 That writes, per clip and per platform: the rendered `.mp4`, the editable `.ass`
 subtitle file behind it, a `_caption.txt` with a suggested title, description
-and hashtags, and one `run_report.json` recording every decision - which
-candidates were scored, why each clip won, which framing mode was chosen and on
-what evidence, and where the captions were placed.
+and hashtags, a `_cover.jpg` chosen from a moment the face tracker was sure
+about, and one `run_report.json` recording every decision - which candidates
+were scored, why each clip won, which framing mode was chosen and on what
+evidence, where the captions were placed, how much dead air came out, and what
+the audio was moved by.
 
 The video analysis is cached in the output folder, so re-running with different
 platforms, styles or clip counts skips straight to rendering.
@@ -256,6 +258,146 @@ other font name is passed straight to libass, so a font installed on the
 rendering machine works too - it just won't travel with the project.
 `fonts.check_font(name)` reports which case you're in.
 
+## The hook, on screen
+
+The captions tell a viewer what is being said. They cannot tell them what the
+clip is about, because at the moment that decision is made the speaker has said
+four words. So the hook the caption pack already computes is also burned across
+the top of the first three seconds, in the same file as the captions.
+
+It is an ASS event rather than a `drawtext` filter, and that choice buys three
+things: it uses the fonts the project ships, so it renders identically on a
+machine that has none of them installed; it survives the two-pass render that a
+segmented clip goes through, where a filter applied per piece would not; and it
+stays editable afterwards, in the same `.ass` file as everything else on screen.
+
+Two details are not obvious until you look at the output.
+
+**Lines are balanced, not filled.** Filling each line to the maximum and letting
+the remainder fall onto the last one is the natural implementation, and it
+produces the thing that makes a title card look amateur: two full lines and a
+third holding one word. The target width is the whole string divided by the
+number of lines it needs, so the words spread evenly.
+
+**The line width is computed, not configured.** How many characters fit depends
+on the frame width, the margins the platform forces, and the font size, and all
+three change between a 720p TikTok export and a 1080p square one. Working it out
+from those three numbers is what lets one style hold up everywhere;
+`title_chars_per_line` overrides it for anyone who disagrees.
+
+The title hangs from the top of the frame and clears each platform's own
+interface the same way the captions clear it from the bottom, which is a
+different measurement: TikTok covers about 10% of the top and 20% of the bottom.
+
+`--no-title` turns it off. Everything about it is a caption-style field, so
+`styles.json` can change the size, the colour, the box behind it, how long it
+holds, or switch it off for one style and not another.
+
+## Audio that arrives at the right level
+
+TikTok, Reels and Shorts all normalise what you upload towards roughly -14
+LUFS. A podcast is not mastered for that, so a clip cut straight out of one
+arrives quiet, gets turned up by the platform along with its room tone, and
+sounds thin next to whatever plays after it.
+
+Two decisions here, and the obvious implementation gets both of them wrong.
+
+**Measure the episode, not the clip.** Running ffmpeg's `loudnorm` per clip is
+the usual answer. It normalises every clip to the target independently, so a
+whisper and a shout come out at the same level and the show loses the dynamics
+that made the moment worth clipping in the first place. Measuring the source
+once and applying that one offset to all of its clips keeps the relationship
+between them, and costs one pass over the audio instead of one per output file.
+The measurement is cached in the output folder next to the frame analysis.
+
+**Gain alone cannot do it.** Conversation that has never been compressed often
+sits at -20 LUFS with peaks already near full scale: there is no headroom to
+raise it into. Clamping the gain to what the peak allows, which is what a
+careful implementation does first, produces no change at all on exactly the
+files that needed it most. So the gain goes in ahead of a limiter, which catches
+the handful of peaks that would clip, and the ceiling is enforced there instead.
+
+The run prints what it found and what it did:
+
+```
+source measures -20.1 LUFS, peak -0.8 dBTP, wide dynamic range - turned up 6.1 dB
+```
+
+Wide dynamic range is reported and not acted on. The fix for it is compression,
+which is a mastering decision, not a repair.
+
+`--no-loudness` exports at whatever level the source sits at.
+
+## Dead air
+
+A podcast is allowed to breathe; short-form is not. But a pause is not
+automatically dead air, and a tool that closes every gap it finds turns
+conversation into an auctioneer's read and kills the beat before a punchline,
+which is the one pause that was doing work.
+
+So the rule is deliberately timid, and it is three rules:
+
+- only gaps of 1.5s or more are candidates, because below that the pause is part
+  of how the sentence is delivered;
+- a cut never closes a gap completely, so the edit sounds like a pause that was
+  shortened rather than a splice;
+- no more than 12% of a clip can come out, largest gaps first, because past a
+  point the answer is a different clip rather than a tighter one.
+
+The head and tail of a clip are never touched. A clip that starts exactly on a
+consonant sounds clipped, and the room at the end is what stops a loop from
+cutting off the last syllable.
+
+One thing worth writing down, because the first version got it backwards. When a
+single gap was larger than the whole budget, it was skipped, which meant the
+longest silence in a clip - the one a viewer would actually leave over - was the
+one guaranteed to survive. It is now shortened by as much as the budget allows.
+
+The cutting itself reuses the machinery that already existed for clips whose
+framing mode changes partway through: each surviving stretch is encoded on its
+own and the pieces are joined. The two reasons to split a clip meet in one
+function, which is what stops the second from quietly undoing the first, and
+there is a test for the specific failure where two same-mode pieces on either
+side of a removed gap get merged back together and the dead air returns while
+every report still claims it was removed.
+
+Captions are moved by the same object that planned the cuts, so they cannot
+drift out of sync with the video. Word timings are remapped onto the shortened
+timeline rather than recomputed.
+
+`--no-trim-silence` keeps every pause. `--min-gap` raises or lowers the
+threshold.
+
+## Cover frames
+
+Every platform takes a cover image and every platform picks a bad one if you let
+it: the frame at a fixed offset, which lands mid-blink, mid-gesture, or on the
+one moment the speaker is looking at their notes.
+
+The frame analysis that already runs for framing knows enough to choose better.
+It knows which sampled frames had a face the detector was confident about, how
+much the picture changed between samples, and where the face sat. A good cover
+is a confident detection during a settled moment, and "settled" is two things
+that are not the same: how much the frame changed, which catches a gesture or a
+cut, and how far the tracked face moved, which catches the middle of a pan. A
+cover taken mid-pan is soft even when the frame it came from was sharp.
+
+Among settled moments the earlier one wins, because a cover near the hook is
+more likely to show what the clip is about than one from the tail.
+
+When there is no confident detection in the whole clip, `pick_time` returns
+nothing rather than the midpoint, and the pipeline falls back to the midpoint
+itself and says so in the report. Returning the midpoint from inside the picker
+would have made "found a good frame" and "gave up" indistinguishable.
+
+One cover per clip, not per platform: the same moment is the right one whatever
+ratio it is cropped to, and fifteen clips across three platforms would otherwise
+mean forty-five near-identical images. It is cropped with the same arithmetic
+the video uses at that instant, so the thumbnail is framed the way the clip is.
+
+No text is burned into it. That is a per-channel design decision and the title
+is already sitting in the caption pack for whoever wants to make it.
+
 ## Regenerating clips
 
 The scorer keeps its whole ranked pool, not just the clips it picked, so
@@ -313,6 +455,16 @@ Two details that took a test to get right:
 Only clips whose boundaries actually moved get re-encoded; the report says which
 with `rendered_this_run`. On a fifteen-clip run, replacing one costs about a
 minute instead of fourteen.
+
+A third detail turned up later, from the other direction. Boundaries are not the
+only thing that decides what comes out of ffmpeg: caption style, resolution,
+framing mode and audio level all change the bytes while leaving start and end
+exactly where they were. A run with a different `--style` therefore found every
+file "already done" and wrote nothing, silently. The session now records the
+recipe a file was made with alongside its boundaries, and a change to any of it
+marks everything stale. A `session.json` written before recipes existed has
+none, and that is read as unchanged rather than stale, so upgrading the project
+does not trigger a full re-render of work that was perfectly good.
 
 ## Long renders
 
@@ -513,19 +665,22 @@ src/ai_clipper/
     decode.py          PyAV frame decoding, identical on every machine
     shots.py           histogram-based shot-change detection
     framing.py         face tracking -> smoothed crop path
-    subtitles.py       ASS generation, caption styles and presets
+    subtitles.py       ASS generation, caption styles, presets and the title card
     fonts.py           bundled font registry
     speakers.py        seat finding and split-view crops
+    audio.py           one loudness measurement per episode, applied to its clips
+    deadair.py         which pauses to shorten, and where the captions land after
+    cover.py           the frame each clip is represented by
+    render.py          ffmpeg: cut, reframe, burn captions
   export/
     platforms.py       per-platform safe areas, ratios and duration caps
     caption_pack.py    hook, title, description and hashtags per clip
-    render.py          ffmpeg: cut, reframe, burn captions
   assets/fonts/        three OFL fonts, inside the package so a wheel carries them
   cli/                 the two console commands
 data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
-tests/                 174 tests, no video or model files needed
+tests/                 230 tests, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
 transcribe_local.py    transcription, from a clone or from beside the video

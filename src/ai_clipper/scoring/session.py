@@ -62,6 +62,8 @@ class Session:
     rejected: List[Tuple[float, float]] = field(default_factory=list)
     # filename -> the (start, end) it was actually encoded with
     rendered: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    # the render options the files on disk were produced with
+    recipe: Dict = field(default_factory=dict)
 
     # --- disk ---------------------------------------------------------------
 
@@ -79,6 +81,7 @@ class Session:
             slots=[Slot.from_dict(s) for s in data.get("slots", [])],
             rejected=[tuple(r) for r in data.get("rejected", [])],
             rendered={k: tuple(v) for k, v in data.get("rendered", {}).items()},
+            recipe=data.get("recipe", {}),
         )
 
     def save(self, out_dir) -> None:
@@ -88,6 +91,7 @@ class Session:
             "slots": [s.as_dict() for s in self.slots],
             "rejected": [list(r) for r in self.rejected],
             "rendered": {k: list(v) for k, v in sorted(self.rendered.items())},
+            "recipe": self.recipe,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # --- reuse --------------------------------------------------------------
@@ -176,3 +180,27 @@ class Session:
     def forget_rendered(self, keep: Sequence[str]) -> None:
         """Drop records for files this run is no longer producing."""
         self.rendered = {k: v for k, v in self.rendered.items() if k in set(keep)}
+
+    def adopt_recipe(self, recipe: Dict) -> bool:
+        """
+        Note the render options for this run, and say whether they changed.
+
+        Boundaries are not the only thing that decides what comes out of ffmpeg.
+        Caption style, resolution, framing mode and audio level all change the
+        bytes while leaving start and end exactly where they were, and until
+        this existed a run with a different --style found every file "already
+        done" and quietly wrote nothing. Answering "yes" here means the files on
+        disk were made to a different recipe and all of them need doing again.
+
+        An older session.json has no recipe at all. That is treated as
+        unchanged rather than stale, so upgrading does not silently trigger a
+        full re-render of work that is perfectly good.
+        """
+        if not self.recipe:
+            self.recipe = dict(recipe)
+            return False
+        if self.recipe == recipe:
+            return False
+        self.recipe = dict(recipe)
+        self.rendered = {}
+        return True

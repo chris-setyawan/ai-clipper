@@ -150,3 +150,55 @@ def test_records_for_files_no_longer_produced_are_dropped():
                         "clip_09_reels.mp4": (0.0, 20.0)}
     session.forget_rendered(["clip_01_tiktok.mp4"])
     assert list(session.rendered) == ["clip_01_tiktok.mp4"]
+
+
+RECIPE = {"style": "punch", "resolution": "720p", "framing_mode": "face",
+          "safe_area": True, "audio_filter": None}
+
+
+def test_the_first_recipe_is_not_a_change():
+    session = Session()
+    assert session.adopt_recipe(RECIPE) is False
+
+
+def test_an_upgraded_session_keeps_its_finished_files():
+    """
+    A session.json written before recipes existed has none. Reading that as
+    "the recipe changed" would re-render an entire episode the first time the
+    user updated the project, for nothing.
+    """
+    session = Session()
+    session.rendered = {"clip_01_tiktok.mp4": (0.0, 20.0)}
+    assert session.adopt_recipe(RECIPE) is False
+    assert session.rendered
+
+
+def test_same_recipe_twice_renders_nothing_again():
+    session = Session()
+    session.adopt_recipe(RECIPE)
+    session.rendered = {"clip_01_tiktok.mp4": (0.0, 20.0)}
+    assert session.adopt_recipe(dict(RECIPE)) is False
+    assert session.rendered
+
+
+def test_changing_the_caption_style_makes_every_file_stale():
+    session = Session()
+    session.adopt_recipe(RECIPE)
+    session.rendered = {"clip_01_tiktok.mp4": (0.0, 20.0)}
+    assert session.adopt_recipe({**RECIPE, "style": "clean"}) is True
+    assert session.rendered == {}
+
+
+def test_changing_the_audio_level_makes_every_file_stale():
+    session = Session()
+    session.adopt_recipe(RECIPE)
+    session.rendered = {"clip_01_tiktok.mp4": (0.0, 20.0)}
+    assert session.adopt_recipe({**RECIPE, "audio_filter": "volume=6.00dB"}) is True
+    assert session.rendered == {}
+
+
+def test_the_recipe_survives_a_round_trip(tmp_path):
+    session = Session(settings=dict(SETTINGS))
+    session.adopt_recipe(RECIPE)
+    session.save(tmp_path)
+    assert Session.load(tmp_path).adopt_recipe(dict(RECIPE)) is False

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from ..export import platforms as plat
 from ..input.fetch import resolve
-from ..export.caption_pack import write_packs
+from ..export.caption_pack import build_pack, write_packs
 from ..scoring.hook_scorer import HookScorer, TranscriptSegment
 from ..scoring.repunctuate import needs_repunctuation, punctuated_fraction, restore_sentence_ends
 from ..scoring import signals as signal_packs
@@ -102,6 +102,20 @@ def main():
     ap.add_argument("--resolution", default="720p", choices=["720p", "1080p"])
     ap.add_argument("--downloads", default="downloads",
                     help="where downloaded videos are kept (default: downloads/)")
+    ap.add_argument("--no-cover", action="store_true",
+                    help="do not write a cover frame beside each clip")
+    ap.add_argument("--no-trim-silence", action="store_true",
+                    help="keep every pause at its original length")
+    ap.add_argument("--min-gap", type=float, default=None,
+                    help="shortest pause that counts as dead air, in seconds "
+                         "(default 1.5). Raise it if the cuts feel rushed.")
+    ap.add_argument("--no-title", action="store_true",
+                    help="do not burn the hook across the opening seconds of "
+                         "each clip")
+    ap.add_argument("--no-loudness", action="store_true",
+                    help="export the audio at whatever level it sits at in the "
+                         "source, instead of matching what the platforms "
+                         "normalise towards")
     ap.add_argument("--no-safe-area", action="store_true",
                     help="keep captions centred instead of shifting them clear "
                          "of each platform's interface")
@@ -303,6 +317,42 @@ def main():
         seats = find_seats(args.video)
         cache.write_bytes(pickle.dumps((crop_path, seats)))
 
+    # One measurement for the episode, reused by every clip cut from it, so the
+    # quiet moments stay quieter than the loud ones. Cached separately from the
+    # frame analysis because it is cheap to redo and the two have no reason to
+    # be invalidated together.
+    audio_filter = None
+    loudness = None
+    if not args.no_loudness:
+        from ..video import audio as audio_level
+
+        level_cache = out_dir / "loudness.json"
+        if level_cache.exists():
+            loudness = audio_level.Loudness(**json.loads(level_cache.read_text()))
+        else:
+            print("Measuring audio level ...")
+            loudness = audio_level.measure(args.video)
+            if loudness:
+                level_cache.write_text(json.dumps(loudness.__dict__), encoding="utf-8")
+        audio_filter = audio_level.filter_chain(loudness)
+        print(f"  {audio_level.describe(loudness)}")
+
+    # Planned before rendering so the count can be reported up front, and so the
+    # subtitle builder and the renderer read the same plan rather than each
+    # working it out.
+    from ..video import deadair
+
+    min_gap = deadair.MIN_GAP if args.min_gap is None else args.min_gap
+    timelines = {}
+    if not args.no_trim_silence:
+        for i, clip in zip(numbers, selection.chosen):
+            timelines[i] = deadair.plan(words, clip.start, clip.end, min_gap=min_gap)
+        cut = {i: t for i, t in timelines.items() if t.cuts}
+        if cut:
+            total = sum(t.removed for t in cut.values())
+            print(f"Trimming dead air from {len(cut)} of {len(timelines)} clips, "
+                  f"{total:.0f}s in total")
+
     mode, reason = recommend_mode(crop_path)
     if args.mode != "auto":
         mode, reason = args.mode, "chosen on the command line"
@@ -341,8 +391,24 @@ def main():
     for leftover in out_dir.glob("*.part.mp4"):
         leftover.unlink()
 
+    # Everything that changes the bytes without changing the boundaries. The
+    # platform list is deliberately not in here: adding a fourth platform should
+    # render the fourth platform, not redo the three that were already fine.
+    recipe = {
+        "style": args.style,
+        "resolution": args.resolution,
+        "framing_mode": mode,
+        "safe_area": not args.no_safe_area,
+        "audio_filter": audio_filter,
+        "title": not args.no_title,
+        "trim_silence": None if args.no_trim_silence else min_gap,
+    }
+
     session.record(entries, selection.rejected)
     session.forget_rendered([p.filename for p in all_plans])
+    if session.adopt_recipe(recipe):
+        print("  render settings changed since the last run, so every file is "
+              "being made again")
     session.save(out_dir)
 
     # A file is done when it exists *and* was encoded from exactly this clip.
@@ -368,29 +434,79 @@ def main():
     render_started = time.time()
     for done, plan in enumerate(plans):
         clip = by_number[plan.clip_index]
-        spec = RenderSpec(ratio=plan.ratio, resolution=plan.resolution, mode=mode)
+        spec = RenderSpec(ratio=plan.ratio, resolution=plan.resolution, mode=mode,
+                          audio_filter=audio_filter)
         out_w, out_h = target_size(spec)
 
         style = (styles[args.style] if args.no_safe_area
                  else plat.style_for(styles[args.style], plan.platform.key))
         clip_words = [w for w in words if w.end > clip.start and w.start < clip.end]
+        # the same line the caption pack files under TITLE, so what is on the
+        # screen and what is in the copy cannot drift apart
+        title = None if args.no_title else build_pack(clip, plan.clip_index).title
+
+        # With cuts, the word times are moved onto the shortened timeline and
+        # the file starts at zero. Without them, nothing changes and the
+        # subtitle builder does the shifting itself, as it always has.
+        timeline = timelines.get(plan.clip_index)
+        cutting = bool(timeline and timeline.cuts)
+        ass_words = (deadair.shift_words(clip_words, timeline, Word)
+                     if cutting else clip_words)
         ass_path = out_dir / f"clip_{plan.clip_index:02d}_{plan.platform.key}.ass"
         ass_path.write_text(
-            build_ass(clip_words, out_w, out_h, style, clip_start=clip.start),
+            build_ass(ass_words, out_w, out_h, style,
+                      clip_start=0.0 if cutting else clip.start, title=title),
             encoding="utf-8",
         )
 
         target = out_dir / plan.filename
+        length = timeline.duration if cutting else clip.duration
         print(f"  [{done + 1}/{len(plans)}] {plan.filename} "
-              f"({clip.duration:.0f}s){_eta(render_started, done, len(plans))}",
+              f"({length:.0f}s){_eta(render_started, done, len(plans))}",
               flush=True)
         render_clip(args.video, clip.start, clip.end, str(target), spec,
-                    str(ass_path), crop_path, clip_seats.get(plan.clip_index, seats))
+                    str(ass_path), crop_path, clip_seats.get(plan.clip_index, seats),
+                    keep_spans=timeline.ranges() if cutting else None)
         rendered.add(plan.filename)
         # recorded as each file lands, so an interrupted run resumes from the
         # last finished file rather than the last finished run
         session.mark_rendered(plan.filename, clip)
         session.save(out_dir)
+
+    # --- one cover frame per clip -------------------------------------------
+    # Per clip rather than per file: the same moment is the right one whatever
+    # ratio it is cropped to, and fifteen clips across three platforms would
+    # otherwise mean forty-five near-identical images.
+    covers = {}
+    if not args.no_cover:
+        from ..video import cover
+        from ..video.render import probe_size, scaled_width_for
+
+        src_w, src_h = probe_size(args.video)
+        first_plan = {}
+        for plan in all_plans:
+            first_plan.setdefault(plan.clip_index, plan)
+
+        for index, plan in sorted(first_plan.items()):
+            clip = by_number[index]
+            spec = RenderSpec(ratio=plan.ratio, resolution=plan.resolution, mode=mode)
+            out_w, out_h = target_size(spec)
+            at = cover.pick_time(crop_path, clip.start, clip.end)
+            scaled_w = scaled_width_for(src_w, src_h, out_h)
+            path = out_dir / f"clip_{index:02d}_cover.jpg"
+            try:
+                cover.write(args.video, at if at is not None else
+                            (clip.start + clip.end) / 2,
+                            str(path), out_w, out_h, mode, crop_path,
+                            scaled_w if scaled_w > out_w else None)
+            except RuntimeError as exc:
+                print(f"  no cover for clip {index}: {exc}")
+                continue
+            covers[index] = round(at, 2) if at is not None else None
+
+        chosen_well = sum(1 for v in covers.values() if v is not None)
+        print(f"{len(covers)} cover frames, {chosen_well} of them on a moment "
+              f"the tracker was sure about")
 
     # The report describes the whole current set, not only what was re-encoded.
     # A run that replaced one clip should still leave a report you can read on
@@ -409,6 +525,9 @@ def main():
             "start": round(clip.start, 2),
             "end": round(clip.end, 2),
             "duration": round(clip.duration, 2),
+            "dead_air_removed": round(timelines[plan.clip_index].removed, 2)
+                                if plan.clip_index in timelines else 0,
+            "cover_at": covers.get(plan.clip_index),
             "score": clip.score,
             "raw_score": round(clip.raw_score, 2),
             "percentile": clip.percentile,
@@ -432,6 +551,8 @@ def main():
             "shots": len(crop_path.shots),
             "seats": len(seats),
             "face_detection_rate": round(crop_path.detection_rate, 3),
+            "source_loudness_lufs": round(loudness.integrated, 2) if loudness else None,
+            "audio_filter": audio_filter,
             "candidates_scored": len(pool),
             "candidates_in_reserve": selection.remaining(),
             "outputs": report,

@@ -52,6 +52,10 @@ class RenderSpec:
     crf: int = 20
     preset: str = "medium"
     audio_bitrate: str = "160k"
+    # -af argument from video.audio, or None to pass the audio through. The same
+    # string is used for every clip in an episode, which is the point: it is
+    # derived from one measurement of the source, not of this clip.
+    audio_filter: Optional[str] = None
 
 
 def target_size(spec: RenderSpec) -> tuple:
@@ -166,6 +170,46 @@ def _burn_subtitles(video_in: str, ass_path: str, out_path: str, spec) -> str:
     return out_path
 
 
+def coalesce(runs: list) -> list:
+    """
+    Merge neighbouring runs that share a mode and touch in time.
+
+    Two reasons this matters. Shot analysis often reports the same framing mode
+    for several consecutive shots, and encoding each of them on its own costs a
+    re-encode and a join for no visible difference. And when a clip is being cut
+    for dead air, the split must survive: two runs that share a mode but sit on
+    either side of a removed gap are not contiguous and must not be merged, or
+    the gap comes back.
+    """
+    merged = []
+    for a, b, mode in runs:
+        if merged and merged[-1][2] == mode and abs(merged[-1][1] - a) < 1e-6:
+            merged[-1] = (merged[-1][0], b, mode)
+        else:
+            merged.append((a, b, mode))
+    return merged
+
+
+def plan_runs(crop_path, spec, spans: list) -> list:
+    """
+    Turn the ranges a clip keeps into the pieces ffmpeg will encode.
+
+    Two independent reasons to split a clip meet here: its framing mode can
+    change partway through, and dead air can have been removed from the middle.
+    Composing them in one place is what stops the second feature from quietly
+    undoing the first.
+    """
+    runs = []
+    for a, b in spans:
+        if crop_path is not None and spec.mode in ("face", "per_shot"):
+            from .framing import segment_modes
+
+            runs.extend(segment_modes(crop_path, a, b, spec.mode))
+        else:
+            runs.append((a, b, spec.mode))
+    return coalesce(runs)
+
+
 def render_segmented(
     source: str,
     runs: list,
@@ -226,8 +270,13 @@ def render_clip(
     seats=None,
     allow_segmentation: bool = True,
     sidecar_stem: Optional[str] = None,
+    keep_spans: Optional[list] = None,
 ) -> str:
     """
+    keep_spans: the ranges of the source this clip keeps, from video.deadair.
+    More than one means the middle has been cut, and the clip is encoded in
+    pieces and joined. None or a single span renders straight through.
+
     crop_path: a CropPath from framing.build_crop_path. Required for face mode;
     without one, face mode falls back to a fixed centre crop rather than failing,
     so a caller that skipped analysis still gets a usable clip.
@@ -252,11 +301,11 @@ def render_clip(
     if os.path.exists(target):
         os.remove(target)
 
-    if allow_segmentation and crop_path is not None and spec.mode in ("face", "per_shot"):
-        from .framing import segment_modes
-
-        runs = segment_modes(crop_path, start, end, spec.mode)
-        if len({mode for _, _, mode in runs}) > 1:
+    cutting = bool(keep_spans) and len(keep_spans) > 1
+    if allow_segmentation and (cutting or
+                               (crop_path is not None and spec.mode in ("face", "per_shot"))):
+        runs = plan_runs(crop_path, spec, list(keep_spans) if cutting else [(start, end)])
+        if cutting or len({mode for _, _, mode in runs}) > 1:
             render_segmented(source, runs, target, spec, ass_path, crop_path, seats)
             os.replace(target, final)
             return final
@@ -297,6 +346,8 @@ def render_clip(
     filter_complex = build_filter(spec, out_w, out_h, ass_path, sendcmd_path,
                                   scaled_w, split_crops)
 
+    audio_args = ["-af", spec.audio_filter] if spec.audio_filter else []
+
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         # -ss before -i seeks quickly; -accurate_seek keeps the cut frame-exact
@@ -307,6 +358,7 @@ def render_clip(
         "-map", "[v]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", spec.preset, "-crf", str(spec.crf),
         "-pix_fmt", "yuv420p",
+        *audio_args,
         "-c:a", "aac", "-b:a", spec.audio_bitrate,
         "-movflags", "+faststart",
         target,
