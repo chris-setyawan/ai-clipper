@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.mp4
+*.mov
+*.wav
+*.mp3
+!data/sample_transcript.json
+.pytest_cache/
+*.egg-info/
+*.cmd
+*.pkl
+build/
+dist/
+out*/
+downloads/
+signals.json
+styles.json
+lexicon.json
+
+# scratch analysis and intermediate frames, not part of the project
+data/work/
+docs/before.png
+docs/after.png

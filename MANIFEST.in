@@ -1,0 +1,4 @@
+include README.md
+include requirements.txt
+include styles.example.json signals.example.json lexicon.example.json
+recursive-include src/ai_clipper/assets *.ttf *.txt

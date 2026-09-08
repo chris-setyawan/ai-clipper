@@ -1,0 +1,21 @@
+# Analysis and rendering
+# Pinned below 5: OpenCV 5 reorganised its Python bindings and no longer
+# exposes cv2.CascadeClassifier or cv2.data at the top level, which is what the
+# face and shot detection rely on.
+opencv-python-headless>=4.8,<5
+numpy>=1.24                    # smoothing and path maths
+
+# Transcription. Pulls in PyAV, which carries its own ffmpeg libraries, so
+# decoding video works without a system ffmpeg install.
+faster-whisper>=1.0
+
+# Downloading from a link. Optional: everything else works on local files.
+yt-dlp>=2024.1
+
+# Tests
+pytest>=7.0
+
+# Not a Python package: rendering clips needs ffmpeg on PATH.
+#   Windows:  winget install Gyan.FFmpeg
+#   macOS:    brew install ffmpeg
+#   Linux:    apt install ffmpeg

@@ -1,0 +1,30 @@
+{
+  "_comment": "Per-project vocabulary. 'exact' fixes mistakes you have actually heard in the audio, written lowercase on the left. 'vocabulary' lists correct terms; near-misses get snapped to them, and the whole list is fed to Whisper as a hint before transcription, which prevents many errors outright. Only add an entry once you have listened and are sure - a wrong guess here is worse than the original error.",
+
+  "_note_on_names": "Prefer putting a name in 'vocabulary' over an 'exact' rule when the wrong spelling is also a real word. 'Arap' is in vocabulary, and only the unambiguous phrase 'reza arab' is corrected outright - a blanket arab -> Arap rule would corrupt any genuine use of the word.",
+
+  "exact": {
+    "sudah dares": "sutradara",
+    "sudares": "sutradara",
+    "dangang": "dangak",
+    "meng-incutkan": "meng-includekan",
+    "mengincutkan": "meng-includekan",
+    "pasang bandang": "pasang badan",
+    "reza arab": "Reza Arap",
+    "ngedirect": "nge-direct"
+  },
+
+  "vocabulary": [
+    "Arap",
+    "Reza Arap",
+    "dangak",
+    "sutradara",
+    "produser",
+    "syuting",
+    "podcast",
+    "editing",
+    "scene"
+  ],
+
+  "fuzzy_threshold": 0.82
+}

@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy this to styles.json and edit. Any field you leave out keeps its default. Reusing a preset name (clean / punch / calm) overrides just those fields; a new name creates a new style. Fonts: Anton, Montserrat ExtraBold and Bebas Neue ship with the project; any other name must be installed on the machine doing the render.",
+
+  "punch": {
+    "highlight": "#FF3B30"
+  },
+
+  "brand": {
+    "font": "Montserrat ExtraBold",
+    "font_size": 70,
+    "primary": "#FFFFFF",
+    "highlight": "#FFC400",
+    "outline_color": "#101010",
+    "outline": 4.5,
+    "shadow": 1.5,
+    "bold": true,
+    "uppercase": true,
+    "words_per_chunk": 3,
+    "bottom_margin_frac": 0.2,
+    "side_margin_frac": 0.07
+  }
+}

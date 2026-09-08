@@ -1,0 +1,20 @@
+{
+  "name": "indonesian-kesehatan",
+  "extends": "indonesian",
+
+  "markers": {
+    "+stakes": ["komplikasi", "kambuh", "operasi", "vonis", "kritis"],
+    "+curiosity": ["banyak yang gak tau", "sering disepelekan"],
+    "+promise": ["gue kasih tips", "saya jelaskan caranya"],
+    "intensity": ["parah", "banget", "kaget", "ngeri"]
+  },
+
+  "weights": {
+    "stakes": 1.5,
+    "personal_story": 2.5
+  },
+
+  "thresholds": {
+    "closing_window": 14.0
+  }
+}
