@@ -112,8 +112,8 @@ nothing - and a file already downloaded is reused instead of fetched again.
 
 That writes, per clip and per platform: the rendered `.mp4`, the editable `.ass`
 subtitle file behind it, a `_caption.txt` with a suggested title, description
-and hashtags, a `_cover.jpg` chosen from a moment the face tracker was sure
-about, and one `run_report.json` recording every decision - which candidates
+and hashtags, a `_cover.jpg` taken from a settled moment with a readable line on
+screen, and one `run_report.json` recording every decision - which candidates
 were scored, why each clip won, which framing mode was chosen and on what
 evidence, where the captions were placed, how much dead air came out, and what
 the audio was moved by.
@@ -258,40 +258,33 @@ other font name is passed straight to libass, so a font installed on the
 rendering machine works too - it just won't travel with the project.
 `fonts.check_font(name)` reports which case you're in.
 
-## The hook, on screen
+## The hook on screen - built, looked at, switched off
 
-The captions tell a viewer what is being said. They cannot tell them what the
-clip is about, because at the moment that decision is made the speaker has said
-four words. So the hook the caption pack already computes is also burned across
-the top of the first three seconds, in the same file as the captions.
+The idea was to burn the hook across the opening seconds, the way every clipping
+tool does. The machinery is here and it works: an ASS event rather than a
+`drawtext` filter, so it uses the fonts the project ships, survives the two-pass
+render a segmented clip goes through, and stays editable afterwards in the same
+file as the captions. Lines are balanced rather than greedily filled, because
+filling to the maximum leaves two full lines and a third holding one word, which
+is what makes a title card look amateur. The line width is computed from the
+frame width, the margins the platform forces and the font size, so one style
+holds up at 720p and 1080p and in 9:16 and 1:1.
 
-It is an ASS event rather than a `drawtext` filter, and that choice buys three
-things: it uses the fonts the project ships, so it renders identically on a
-machine that has none of them installed; it survives the two-pass render that a
-segmented clip goes through, where a filter applied per piece would not; and it
-stays editable afterwards, in the same `.ass` file as everything else on screen.
+Then a reviewer watched fifteen clips with it on and said it made them worse.
 
-Two details are not obvious until you look at the output.
+The reason is not the rendering, it is the text. The hook comes from
+`extract_hook`, which takes the first sentence of the clip carrying enough
+content words. So the title says the same thing as the subtitle that arrives
+underneath it two seconds later, and the frame ends up with two blocks of text
+reading the same line. What a title card actually needs is a written headline,
+which is a thing a transcript does not contain.
 
-**Lines are balanced, not filled.** Filling each line to the maximum and letting
-the remainder fall onto the last one is the natural implementation, and it
-produces the thing that makes a title card look amateur: two full lines and a
-third holding one word. The target width is the whole string divided by the
-number of lines it needs, so the words spread evenly.
-
-**The line width is computed, not configured.** How many characters fit depends
-on the frame width, the margins the platform forces, and the font size, and all
-three change between a 720p TikTok export and a 1080p square one. Working it out
-from those three numbers is what lets one style hold up everywhere;
-`title_chars_per_line` overrides it for anyone who disagrees.
-
-The title hangs from the top of the frame and clears each platform's own
-interface the same way the captions clear it from the bottom, which is a
-different measurement: TikTok covers about 10% of the top and 20% of the bottom.
-
-`--no-title` turns it off. Everything about it is a caption-style field, so
-`styles.json` can change the size, the colour, the box behind it, how long it
-holds, or switch it off for one style and not another.
+So it is off by default. `--title` turns it on, and every part of it is a
+caption-style field, so `styles.json` can change the size, colour, box, how long
+it holds, or switch it off for one style and not another. It is worth keeping
+reachable because the moment there is a hand-written headline to put in it - a
+column in a spreadsheet, an argument, an LLM - the rendering side is already
+solved and measured.
 
 ## Audio that arrives at the right level
 
@@ -374,29 +367,51 @@ Every platform takes a cover image and every platform picks a bad one if you let
 it: the frame at a fixed offset, which lands mid-blink, mid-gesture, or on the
 one moment the speaker is looking at their notes.
 
-The frame analysis that already runs for framing knows enough to choose better.
-It knows which sampled frames had a face the detector was confident about, how
-much the picture changed between samples, and where the face sat. A good cover
-is a confident detection during a settled moment, and "settled" is two things
-that are not the same: how much the frame changed, which catches a gesture or a
-cut, and how far the tracked face moved, which catches the middle of a pan. A
-cover taken mid-pan is soft even when the frame it came from was sharp.
+Two things decide the moment, and the second one arrived after looking at a real
+run.
 
-Among settled moments the earlier one wins, because a cover near the hook is
-more likely to show what the clip is about than one from the tail.
+**The picture has to be settled.** The frame analysis that already runs for
+framing knows which sampled frames had a face the detector was confident about,
+how much the picture changed between samples, and where the face sat. "Settled"
+is two measurements that are not the same: how much the frame changed, which
+catches a gesture or a cut, and how far the tracked face moved, which catches
+the middle of a pan. A cover taken mid-pan is soft even when the frame it came
+from was sharp.
 
-When there is no confident detection in the whole clip, `pick_time` returns
+**Something has to be being said.** Stillness alone will happily choose a second
+where nobody is talking, and a thumbnail with no words on it throws away the
+line that would have made someone stop. Candidate moments are drawn from inside
+the caption chunks, using the same chunking the subtitles use, so a moment that
+scores well is a moment where that exact line is on screen rather than an
+approximation of one. A line long enough to read but short enough to take in at
+a glance wins.
+
+The weight between the two is what decides which rule wins when they disagree,
+and it is set so a well-sized line beats a moderately calmer frame but loses to
+an obviously bad one. A cover that is sharp and wordless is still usable; a
+blurred one with a good line on it is not. There is a test for each direction.
+
+The frame comes out of the rendered clip, not out of the source. That is not an
+optimisation, it is the whole reason the cover matches: the clip has already
+been reframed for the platform and has its captions burned in, so a still from
+it is by construction what a viewer would see if they paused there. The first
+version cropped the source and repeated the crop arithmetic to stay in sync with
+the video, which is two implementations of one idea and only one of them was
+ever tested.
+
+When there is no confident detection anywhere in the clip, `pick_time` returns
 nothing rather than the midpoint, and the pipeline falls back to the midpoint
 itself and says so in the report. Returning the midpoint from inside the picker
 would have made "found a good frame" and "gave up" indistinguishable.
 
 One cover per clip, not per platform: the same moment is the right one whatever
 ratio it is cropped to, and fifteen clips across three platforms would otherwise
-mean forty-five near-identical images. It is cropped with the same arithmetic
-the video uses at that instant, so the thumbnail is framed the way the clip is.
+mean forty-five near-identical images.
 
-No text is burned into it. That is a per-channel design decision and the title
-is already sitting in the caption pack for whoever wants to make it.
+How many words land on the cover is `words_per_chunk` from the caption style, so
+it is the same trade-off as the captions themselves: `punch` puts two words on
+screen at a time and makes a punchy, sparse thumbnail, `calm` puts five and
+gives it a full line to read.
 
 ## Regenerating clips
 
@@ -614,6 +629,13 @@ Neither attempt was wasted: between them they established that speaker identity
 is not obtainable here without a trained model, and that split-view - the actual
 differentiating feature - never needed it.
 
+### The hook burned across the opening - measured and switched off
+
+Built, watched on fifteen clips, turned off. It is not a rendering problem: the
+text comes from the transcript, so the title says the same thing as the subtitle
+arriving under it two seconds later. Full account under "The hook on screen"
+above, including why the code is still reachable behind `--title`.
+
 ### Trimming a clip back to its subject - measured and rejected
 
 The reverse of extension: when a clip's end sits past a topic boundary, pull it
@@ -670,7 +692,7 @@ src/ai_clipper/
     speakers.py        seat finding and split-view crops
     audio.py           one loudness measurement per episode, applied to its clips
     deadair.py         which pauses to shorten, and where the captions land after
-    cover.py           the frame each clip is represented by
+    cover.py           which moment of a clip stands in for it
     render.py          ffmpeg: cut, reframe, burn captions
   export/
     platforms.py       per-platform safe areas, ratios and duration caps
@@ -680,7 +702,7 @@ src/ai_clipper/
 data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
-tests/                 230 tests, no video or model files needed
+tests/                 232 tests, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
 transcribe_local.py    transcription, from a clone or from beside the video

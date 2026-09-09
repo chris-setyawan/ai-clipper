@@ -6,22 +6,37 @@ it: the frame at a fixed offset, which lands mid-blink, mid-gesture, or on the
 one moment the speaker is looking at their notes. Choosing it by hand is thirty
 seconds per clip and nobody does it.
 
-The frame analysis this project already runs for framing knows more than enough
-to choose better. It knows which sampled frames had a face the detector was
-confident about, how much the picture changed between samples, and where the
-face sat. A good cover is a confident detection during a settled moment, which
-is a two-line rule over data that has already been computed and cached.
+Two things decide the moment, and the second one arrived after looking at a real
+run.
 
-What it deliberately does not do is add text. A cover with a headline burned
-into it is a design decision that depends on the channel, and the clip already
-ships with a title in its caption pack for whoever wants to make that call.
+**The picture has to be settled.** The frame analysis that already runs for
+framing knows which sampled frames had a face the detector was confident about,
+how much the picture changed between samples, and where the face sat. "Settled"
+is two measurements that are not the same: how much the frame changed, which
+catches a gesture or a cut, and how far the tracked face moved, which catches
+the middle of a pan. A cover taken mid-pan is soft even when the frame it came
+from was sharp.
+
+**Something has to be being said.** Stillness alone will happily choose a second
+where nobody is talking, and a thumbnail with no words on it throws away the
+line that would have made someone stop. So candidate moments are drawn from
+inside the caption chunks, and a chunk long enough to read but short enough to
+take in at a glance is preferred.
+
+The frame is then taken out of the rendered clip rather than out of the source.
+That is not an optimisation, it is the whole reason the cover matches: the clip
+has already been reframed for the platform and has its captions burned in, so a
+still from it is by construction exactly what a viewer would see if they paused
+there. The first version cropped the source itself and had to repeat the crop
+arithmetic to stay in sync with the video, which is two implementations of one
+idea and only one of them was ever tested.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 # Nobody looks their best on the first or last frame of a cut.
 EDGE_MARGIN = 1.0
@@ -30,20 +45,16 @@ EDGE_MARGIN = 1.0
 # settled. Two samples is a fifth of a second at the usual sampling rate.
 NEIGHBOURS = 2
 
+# A caption this long is a paragraph at thumbnail size; this short is a fragment.
+IDEAL_CHARS = (12, 44)
+
 
 def _in_range(keyframes: Sequence, start: float, end: float) -> List:
     return [k for k in keyframes if start <= k.t <= end]
 
 
 def _stillness(keyframes: Sequence, index: int) -> float:
-    """
-    How settled the picture is around one keyframe. Higher is calmer.
-
-    Two things count and they are different: how much the frame changed, which
-    catches a gesture or a cut, and how far the tracked face moved, which
-    catches the middle of a pan. A cover taken mid-pan is soft even when the
-    frame it came from was sharp.
-    """
+    """How settled the picture is around one keyframe. Higher is calmer."""
     window = keyframes[max(0, index - NEIGHBOURS): index + NEIGHBOURS + 1]
     if not window:
         return 0.0
@@ -57,7 +68,23 @@ def _stillness(keyframes: Sequence, index: int) -> float:
     return -(motion + drift * 4.0)
 
 
+def readability(text: str) -> float:
+    """
+    How well a caption line works as the words on a thumbnail.
+
+    Zero outside the readable range rather than negative, so a clip whose lines
+    are all too long still gets a cover; it just stops preferring one line over
+    another and lets stillness decide.
+    """
+    n = len(text.strip())
+    low, high = IDEAL_CHARS
+    if n < low or n > high:
+        return 0.0
+    return 1.0 - abs(n - (low + high) / 2.0) / ((high - low) / 2.0)
+
+
 def pick_time(crop_path, start: float, end: float,
+              words: Optional[Sequence] = None, per_chunk: int = 3,
               edge: float = EDGE_MARGIN) -> Optional[float]:
     """
     The best moment to freeze, or None if the analysis offers nothing better
@@ -80,55 +107,71 @@ def pick_time(crop_path, start: float, end: float,
     if not confident:
         return None
 
+    spoken = _spoken_windows(words, start, end, per_chunk) if words else []
+
     # Among settled moments, the earlier one wins. A cover taken near the hook
     # is more likely to show what the clip is actually about than one from the
     # tail, where the subject has usually moved on.
-    scored = [
-        (_stillness(inner, i) - (k.t - inner[0].t) * 0.02, k.t)
-        for i, k in confident
-    ]
+    scored = []
+    for i, k in confident:
+        bonus = _line_bonus(spoken, k.t)
+        scored.append((_stillness(inner, i) + bonus - (k.t - inner[0].t) * 0.02, k.t))
     return max(scored)[1]
 
 
-def crop_x(crop_path, t: float, scaled_width: int, out_width: int) -> int:
+def _spoken_windows(words: Sequence, start: float, end: float,
+                    per_chunk: int) -> List[Tuple[float, float, float]]:
     """
-    Where the crop window sits at t, in the scaled frame.
+    (from, to, readability) for each caption chunk inside the clip.
 
-    The same arithmetic the sendcmd script uses, so the cover is framed exactly
-    the way the video is at that instant rather than approximately.
+    Built with the same chunking the subtitles use, so a moment that scores well
+    here is a moment where that exact line is on screen, not an approximation of
+    one.
     """
-    center = crop_path.center_at(t) if crop_path is not None else 0.5
-    x = int(round(center * scaled_width - out_width / 2))
-    return min(max(x, 0), max(0, scaled_width - out_width))
+    from .subtitles import chunk_words
+
+    inside = [w for w in words if w.end > start and w.start < end]
+    if not inside:
+        return []
+
+    windows = []
+    for chunk in chunk_words(inside, per_chunk):
+        text = " ".join(w.text for w in chunk.words)
+        windows.append((chunk.start, chunk.end, readability(text)))
+    return windows
 
 
-def _filter(mode: str, out_w: int, out_h: int,
-            scaled_w: Optional[int], x: Optional[int]) -> str:
-    if mode in ("face", "per_shot") and scaled_w and x is not None:
-        return f"scale={scaled_w}:{out_h},crop={out_w}:{out_h}:{x}:0"
-    return (f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
-            f"crop={out_w}:{out_h}")
-
-
-def write(source: str, t: float, out_path: str, out_w: int, out_h: int,
-          mode: str = "crop", crop_path=None, scaled_w: Optional[int] = None,
-          quality: int = 3) -> str:
+def _line_bonus(windows: Sequence, t: float, weight: float = 8.0) -> float:
     """
-    Write one frame, framed and sized the way the clip is.
+    How much preferring a readable line is worth against holding still.
 
-    Same atomic-write discipline as the renderer: a half-written JPEG is a
-    valid-looking file, and a resumed run would take it for finished work.
+    The weight is what decides which of the two rules wins when they disagree,
+    and it is set so that a well-sized line beats a moderately calmer frame but
+    loses to an obviously bad one. A cover that is sharp and wordless is still a
+    usable cover; a blurred one with a good line on it is not.
+    """
+    for a, b, score in windows:
+        if a <= t <= b:
+            return score * weight
+    return 0.0
+
+
+def grab(clip_file: str, at: float, out_path: str, quality: int = 3) -> str:
+    """
+    Take one frame out of a rendered clip.
+
+    `at` is a time inside the clip, not inside the source episode. Same atomic
+    write as the renderer: a half-written JPEG is a valid-looking file, and a
+    resumed run would take it for finished work.
     """
     final = os.path.abspath(out_path)
     os.makedirs(os.path.dirname(final), exist_ok=True)
     target = final + ".part.jpg"
 
-    x = crop_x(crop_path, t, scaled_w, out_w) if scaled_w else None
     proc = subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-accurate_seek", "-ss", f"{t:.3f}", "-i", source,
-        "-frames:v", "1", "-vf", _filter(mode, out_w, out_h, scaled_w, x),
-        "-q:v", str(quality), target,
+        "-accurate_seek", "-ss", f"{max(0.0, at):.3f}", "-i", clip_file,
+        "-frames:v", "1", "-q:v", str(quality), target,
     ], capture_output=True, text=True)
 
     if proc.returncode != 0:

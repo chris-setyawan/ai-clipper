@@ -109,9 +109,11 @@ def main():
     ap.add_argument("--min-gap", type=float, default=None,
                     help="shortest pause that counts as dead air, in seconds "
                          "(default 1.5). Raise it if the cuts feel rushed.")
-    ap.add_argument("--no-title", action="store_true",
-                    help="do not burn the hook across the opening seconds of "
-                         "each clip")
+    ap.add_argument("--title", action="store_true",
+                    help="burn the hook across the opening seconds of each "
+                         "clip. Off by default: the hook is the first sentence "
+                         "of the transcript, so it repeats the subtitle that "
+                         "arrives underneath it a moment later. See the README.")
     ap.add_argument("--no-loudness", action="store_true",
                     help="export the audio at whatever level it sits at in the "
                          "source, instead of matching what the platforms "
@@ -400,7 +402,7 @@ def main():
         "framing_mode": mode,
         "safe_area": not args.no_safe_area,
         "audio_filter": audio_filter,
-        "title": not args.no_title,
+        "title": bool(args.title),
         "trim_silence": None if args.no_trim_silence else min_gap,
     }
 
@@ -443,7 +445,7 @@ def main():
         clip_words = [w for w in words if w.end > clip.start and w.start < clip.end]
         # the same line the caption pack files under TITLE, so what is on the
         # screen and what is in the copy cannot drift apart
-        title = None if args.no_title else build_pack(clip, plan.clip_index).title
+        title = build_pack(clip, plan.clip_index).title if args.title else None
 
         # With cuts, the word times are moved onto the shortened timeline and
         # the file starts at zero. Without them, nothing changes and the
@@ -480,29 +482,35 @@ def main():
     covers = {}
     if not args.no_cover:
         from ..video import cover
-        from ..video.render import probe_size, scaled_width_for
 
-        src_w, src_h = probe_size(args.video)
         first_plan = {}
         for plan in all_plans:
             first_plan.setdefault(plan.clip_index, plan)
 
         for index, plan in sorted(first_plan.items()):
             clip = by_number[index]
-            spec = RenderSpec(ratio=plan.ratio, resolution=plan.resolution, mode=mode)
-            out_w, out_h = target_size(spec)
-            at = cover.pick_time(crop_path, clip.start, clip.end)
-            scaled_w = scaled_width_for(src_w, src_h, out_h)
+            source_clip = out_dir / plan.filename
+            if not source_clip.exists():
+                continue
+
+            # The frame comes out of the finished clip, so it carries the
+            # platform's framing and the burned-in caption without this having
+            # to reproduce either.
+            at = cover.pick_time(crop_path, clip.start, clip.end, words,
+                                 per_chunk=styles[args.style].words_per_chunk)
+            source_time = at if at is not None else (clip.start + clip.end) / 2
+
+            timeline = timelines.get(index)
+            in_clip = (timeline.remap(source_time)
+                       if timeline and timeline.cuts else source_time - clip.start)
+
             path = out_dir / f"clip_{index:02d}_cover.jpg"
             try:
-                cover.write(args.video, at if at is not None else
-                            (clip.start + clip.end) / 2,
-                            str(path), out_w, out_h, mode, crop_path,
-                            scaled_w if scaled_w > out_w else None)
+                cover.grab(str(source_clip), in_clip, str(path))
             except RuntimeError as exc:
                 print(f"  no cover for clip {index}: {exc}")
                 continue
-            covers[index] = round(at, 2) if at is not None else None
+            covers[index] = round(source_time, 2) if at is not None else None
 
         chosen_well = sum(1 for v in covers.values() if v is not None)
         print(f"{len(covers)} cover frames, {chosen_well} of them on a moment "
