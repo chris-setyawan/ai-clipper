@@ -17,11 +17,17 @@ catches a gesture or a cut, and how far the tracked face moved, which catches
 the middle of a pan. A cover taken mid-pan is soft even when the frame it came
 from was sharp.
 
-**Something has to be being said.** Stillness alone will happily choose a second
-where nobody is talking, and a thumbnail with no words on it throws away the
-line that would have made someone stop. So candidate moments are drawn from
-inside the caption chunks, and a chunk long enough to read but short enough to
-take in at a glance is preferred.
+**Something has to be on screen worth reading.** Stillness alone will happily
+choose a second where nobody is talking, and a thumbnail with no words on it
+throws away the line that would have made someone stop. So a visible caption is
+a requirement rather than a preference, and among the moments that have one, a
+line whose words carry something is preferred and the calmest of those wins. The
+requirement drops only for a clip where no moment has both a caption and a
+confident face.
+
+Which lines carry is not measured here. It is asked of `scoring/signals.py`, the
+same banks the clip scorer uses, so the vocabulary that decides which moment is
+worth clipping also decides which frame represents it.
 
 The frame is then taken out of the rendered clip rather than out of the source.
 That is not an optimisation, it is the whole reason the cover matches: the clip
@@ -45,8 +51,13 @@ EDGE_MARGIN = 1.0
 # settled. Two samples is a fifth of a second at the usual sampling rate.
 NEIGHBOURS = 2
 
-# A caption this long is a paragraph at thumbnail size; this short is a fragment.
-IDEAL_CHARS = (12, 44)
+# Past this, a caption is a paragraph at thumbnail size whatever it says.
+MAX_CHARS = 44
+
+# What a marker word or a figure is worth on top of the content fraction. It is
+# added rather than clamped in, so that "MARGIN CALL" still beats "KEBIJAKAN
+# PEMERINTAH" even though both are two words that carry.
+LOADED = 0.35
 
 
 def _in_range(keyframes: Sequence, start: float, end: float) -> List:
@@ -68,19 +79,95 @@ def _stillness(keyframes: Sequence, index: int) -> float:
     return -(motion + drift * 4.0)
 
 
-def readability(text: str) -> float:
+def line_value(text: str) -> float:
     """
     How well a caption line works as the words on a thumbnail.
 
-    Zero outside the readable range rather than negative, so a clip whose lines
-    are all too long still gets a cover; it just stops preferring one line over
-    another and lets stillness decide.
+    1.0 means every word on screen carries something; a figure with a unit adds
+    on top, so a loaded line can score above 1. The scale only has to be
+    consistent, because it is weighed against stillness and nothing else.
+
+    Two versions of this were wrong before the third, and both were wrong in the
+    same way: they measured something that correlated with a good line instead
+    of the line itself.
+
+    The first measured length. The caption style puts two words on screen at a
+    time, so every line came out between 15 and 21 characters and the rule never
+    chose between anything. "TRANSAKSI HARIAN" and "MANAJEMEN DALAM" scored
+    identically, and only one of those reads as a phrase.
+
+    The second counted content words, tokenising the line first. Tokenising
+    drops numerals, so "Hampir 90" was scored as the single word "hampir",
+    came out perfect, and pushed number fragments to the top of eleven of
+    fifteen clips. The lines got measurably better and visibly worse.
+
+    So the denominator is now the words a viewer actually sees, and a bare
+    numeral only counts when the line gives it a unit: "16 RIBU" is a thumbnail,
+    "PALING 3" is the middle of a sentence.
     """
-    n = len(text.strip())
-    low, high = IDEAL_CHARS
-    if n < low or n > high:
+    from ..scoring import signals
+
+    stripped = text.strip()
+    shown = [w for w in stripped.split() if any(ch.isalnum() for ch in w)]
+    if not shown:
         return 0.0
-    return 1.0 - abs(n - (low + high) / 2.0) / ((high - low) / 2.0)
+
+    pack = signals.active()
+    weak = pack.stopwords | pack.filler | pack.weak_words
+    plain = [w.strip(".,!?:;\"'-").lower() for w in shown]
+    united = _has_unit(plain, stripped, pack)
+
+    carrying = 0
+    for word in plain:
+        if any(ch.isdigit() for ch in word):
+            carrying += 1 if united else 0
+        elif word not in weak and len(word) >= 4:
+            carrying += 1
+
+    value = carrying / len(shown)
+
+    # A chunk can end up holding a single word, at a sentence end or where a
+    # pause split it early, and one word scoring full marks put "BEDA." on a
+    # cover. A thumbnail needs a phrase, so a lone word is worth half of one.
+    if len(shown) < 2:
+        value *= 0.5
+
+    # Whisper repeats itself on a stumble, and "TERNYATA TERNYATA" is not a
+    # thumbnail however well its words score.
+    if len(set(plain)) < len(plain):
+        value *= 0.5
+
+    if united or _is_loaded(plain, stripped, pack):
+        value += LOADED
+    if len(stripped) > MAX_CHARS:
+        value *= 0.5
+    return value
+
+
+def _has_unit(plain: Sequence, text: str, pack) -> bool:
+    """
+    Whether a figure in the line is attached to something that gives it scale.
+
+    Without one a numeral is the middle of a sentence rather than a claim.
+    """
+    if not any(any(ch.isdigit() for ch in w) for w in plain):
+        return False
+    return "%" in text or any(w in pack.quantity_words for w in plain)
+
+
+def _is_loaded(plain: Sequence, text: str, pack) -> bool:
+    """Whether the line carries weight rather than only naming things."""
+    banks = (pack.stakes_markers, pack.curiosity_markers,
+             pack.contrarian_markers, pack.intensity_markers)
+    lowered = text.lower()
+    for bank in banks:
+        for phrase in bank:
+            if " " in phrase:
+                if phrase in lowered:
+                    return True
+            elif phrase in plain:
+                return True
+    return False
 
 
 def pick_time(crop_path, start: float, end: float,
@@ -109,12 +196,20 @@ def pick_time(crop_path, start: float, end: float,
 
     spoken = _spoken_windows(words, start, end, per_chunk) if words else []
 
-    # Among settled moments, the earlier one wins. A cover taken near the hook
-    # is more likely to show what the clip is actually about than one from the
+    # A caption on the cover is a requirement, not a preference, and the
+    # fallback is only for a clip where no moment has both a caption and a face.
+    # Making it a weight instead was the first attempt: a very calm moment in
+    # the gap between two words outscored every moment with words on screen, and
+    # the cover came out wordless on a run where the report said otherwise.
+    speaking = [(i, k) for i, k in confident if _line_at(spoken, k.t) is not None]
+    candidates = speaking or confident
+
+    # Among them, the calmest wins, and ties go to the earlier one: a cover near
+    # the hook is more likely to show what the clip is about than one from the
     # tail, where the subject has usually moved on.
     scored = []
-    for i, k in confident:
-        bonus = _line_bonus(spoken, k.t)
+    for i, k in candidates:
+        bonus = (_line_at(spoken, k.t) or 0.0) * LINE_WEIGHT
         scored.append((_stillness(inner, i) + bonus - (k.t - inner[0].t) * 0.02, k.t))
     return max(scored)[1]
 
@@ -122,11 +217,18 @@ def pick_time(crop_path, start: float, end: float,
 def _spoken_windows(words: Sequence, start: float, end: float,
                     per_chunk: int) -> List[Tuple[float, float, float]]:
     """
-    (from, to, readability) for each caption chunk inside the clip.
+    (from, to, value) for every span where a caption is actually visible.
 
-    Built with the same chunking the subtitles use, so a moment that scores well
-    here is a moment where that exact line is on screen, not an approximation of
-    one.
+    Spans are per word, not per chunk, and that distinction is the whole point.
+    A chunk looks continuous in the transcript, but the karaoke effect emits one
+    event per word, running from that word's start to its end, so the short gaps
+    between words are gaps where nothing is on screen at all. Scoring by chunk
+    put a cover in one of those holes on the first real run: the picture was
+    good, the report said a line was showing, and the thumbnail was wordless.
+
+    The last word of a chunk is held until the chunk ends, exactly as the
+    subtitle builder holds it, so this has to mirror that too. Readability is
+    still judged on the whole chunk, because that is what a viewer reads.
     """
     from .subtitles import chunk_words
 
@@ -136,24 +238,30 @@ def _spoken_windows(words: Sequence, start: float, end: float,
 
     windows = []
     for chunk in chunk_words(inside, per_chunk):
-        text = " ".join(w.text for w in chunk.words)
-        windows.append((chunk.start, chunk.end, readability(text)))
+        score = line_value(" ".join(w.text for w in chunk.words))
+        for i, word in enumerate(chunk.words):
+            last = i == len(chunk.words) - 1
+            windows.append((word.start, chunk.end if last else word.end, score))
     return windows
 
 
-def _line_bonus(windows: Sequence, t: float, weight: float = 8.0) -> float:
+def _line_at(windows: Sequence, t: float) -> Optional[float]:
     """
-    How much preferring a readable line is worth against holding still.
+    The value of whatever caption is on screen at t, or None if none is.
 
-    The weight is what decides which of the two rules wins when they disagree,
-    and it is set so that a well-sized line beats a moderately calmer frame but
-    loses to an obviously bad one. A cover that is sharp and wordless is still a
-    usable cover; a blurred one with a good line on it is not.
+    None and 0.0 are different answers and the caller depends on the
+    difference: nothing showing at all, versus a line showing whose words
+    happen to carry nothing. A cover still wants the second one.
     """
     for a, b, score in windows:
         if a <= t <= b:
-            return score * weight
-    return 0.0
+            return score
+    return None
+
+
+# How much a well-sized line is worth against holding still, once both moments
+# already have a caption on them.
+LINE_WEIGHT = 8.0
 
 
 def grab(clip_file: str, at: float, out_path: str, quality: int = 3) -> str:

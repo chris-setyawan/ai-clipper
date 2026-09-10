@@ -77,10 +77,35 @@ def test_a_clip_shorter_than_the_edge_margin_still_gets_a_frame():
 
 # --- the words on the thumbnail ---------------------------------------------
 
-def test_a_line_of_the_right_length_reads_best():
-    assert cover.readability("sampe gontok-gontokan lah") > 0
-    assert cover.readability("ya") == 0
-    assert cover.readability("x" * 200) == 0
+def test_a_line_is_judged_by_what_its_words_carry():
+    """
+    Both of these are two words and about the same length. Measuring length,
+    which the first version did, scored them identically.
+    """
+    assert cover.line_value("transaksi harian") > cover.line_value("manajemen dalam")
+
+
+def test_glue_and_filler_score_nothing():
+    assert cover.line_value("mungkin, pokoknya") == 0
+    assert cover.line_value("ya") == 0
+    assert cover.line_value("") == 0
+
+
+def test_a_stakes_word_lifts_a_line():
+    assert cover.line_value("margin call") > cover.line_value("kebetulan ditawarin")
+
+
+def test_a_figure_counts_even_though_it_is_not_a_word():
+    """
+    "1,8T" is short and has no long tokens, so the content rule alone scores it
+    at nothing, and it is a better thumbnail than most full phrases.
+    """
+    assert cover.line_value("1,8 triliun") > 0
+
+
+def test_a_paragraph_is_discounted_however_good_its_words_are():
+    long_line = "margin call " * 8
+    assert cover.line_value(long_line) < cover.line_value("margin call")
 
 
 def test_a_moment_with_a_readable_line_beats_a_silent_one():
@@ -95,18 +120,52 @@ def test_a_moment_with_a_readable_line_beats_a_silent_one():
     assert 6.0 <= at <= 8.0
 
 
-def test_a_readable_line_does_not_rescue_a_bad_frame():
+def test_a_caption_is_required_not_merely_preferred():
     """
-    A sharp wordless cover is still usable; a blurred one with a good line is
-    not. The line bonus has to lose to an obviously worse picture.
+    A wordless cover throws away the line that makes someone stop, so a calmer
+    silent moment does not win. Weighting this instead of requiring it is what
+    produced a wordless cover on the first real run.
     """
     frames = (
-        steady(0, 12, step=0.25, motion=0.2)                  # calm, silent
-        + [(3.0 + i * 0.25, 0.2 + i * 0.06, True, 90.0) for i in range(12)]
+        steady(0, 12, step=0.25, motion=0.2)                  # very calm, silent
+        + steady(3.0, 12, step=0.25, motion=8.0)              # busier, but spoken
     )
     words = speech(3.0, 6, "gontokan")
     at = cover.pick_time(path_of(*frames), 0, 6, words=words, per_chunk=3, edge=0.5)
-    assert at < 3.0
+    assert at >= 3.0
+
+
+def test_the_gap_between_two_words_is_not_a_caption():
+    """
+    The bug this exists for: a chunk looks continuous in the transcript, but
+    the karaoke effect draws one event per word, so the moment between two
+    words has nothing on screen. Scoring by chunk put a cover in one of those
+    holes while the report claimed a line was showing.
+    """
+    frames = [(1.0, 0.5, True, 40.0), (1.45, 0.5, True, 0.1), (2.0, 0.5, True, 40.0)]
+    # words at 0.9-1.1 and 1.9-2.1, so 1.45 is a hole even though the chunk
+    # spans it
+    words = [Word(0.9, 1.1, "gontokan"), Word(1.9, 2.1, "banget")]
+    at = cover.pick_time(path_of(*frames), 0, 3, words=words, per_chunk=3, edge=0.0)
+    assert at != 1.45
+
+
+def test_the_last_word_is_held_until_the_chunk_ends():
+    """Mirrors how the subtitle builder holds the final word of a chunk."""
+    words = [Word(0.0, 0.4, "sampe"), Word(0.5, 0.7, "gontokan")]
+    spans = cover._spoken_windows(words, 0, 5, per_chunk=2)
+    assert spans[-1][1] >= 0.7
+
+
+def test_a_visible_but_weak_line_still_counts_as_visible():
+    """
+    A value of 0 means "these words carry nothing", not "nothing is on screen".
+    A cover with a weak line still beats one with no line at all.
+    """
+    frames = steady(0, 12, step=0.25, motion=0.2) + steady(3.0, 12, step=0.25, motion=8.0)
+    words = [Word(3.0 + i * 0.4, 3.0 + i * 0.4 + 0.35, "ya") for i in range(6)]
+    at = cover.pick_time(path_of(*frames), 0, 6, words=words, per_chunk=1, edge=0.5)
+    assert at >= 3.0
 
 
 def test_words_are_optional():
@@ -114,7 +173,7 @@ def test_words_are_optional():
     assert cover.pick_time(path_of(*frames), 0, 10, words=[], edge=0.5) is not None
 
 
-def test_a_clip_where_every_line_is_too_long_still_gets_a_cover():
+def test_a_clip_where_every_line_is_weak_still_gets_a_cover():
     frames = steady(0, 20, step=0.5)
-    words = [Word(i * 0.5, i * 0.5 + 0.4, "kepanjangansekali" * 3) for i in range(20)]
+    words = [Word(i * 0.5, i * 0.5 + 0.4, "mungkin") for i in range(20)]
     assert cover.pick_time(path_of(*frames), 0, 10, words=words, edge=0.5) is not None

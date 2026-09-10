@@ -378,18 +378,62 @@ catches a gesture or a cut, and how far the tracked face moved, which catches
 the middle of a pan. A cover taken mid-pan is soft even when the frame it came
 from was sharp.
 
-**Something has to be being said.** Stillness alone will happily choose a second
-where nobody is talking, and a thumbnail with no words on it throws away the
-line that would have made someone stop. Candidate moments are drawn from inside
-the caption chunks, using the same chunking the subtitles use, so a moment that
-scores well is a moment where that exact line is on screen rather than an
-approximation of one. A line long enough to read but short enough to take in at
-a glance wins.
+**Something has to be on screen to read.** Stillness alone will happily choose a
+second where nobody is talking, and a thumbnail with no words on it throws away
+the line that would have made someone stop. So a visible caption is a
+requirement, not a preference: among the moments that have one, the calmest wins
+and a line long enough to read but short enough to take in at a glance is
+preferred. The requirement drops only for a clip where no moment has both a
+caption and a confident face.
 
-The weight between the two is what decides which rule wins when they disagree,
-and it is set so a well-sized line beats a moderately calmer frame but loses to
-an obviously bad one. A cover that is sharp and wordless is still usable; a
-blurred one with a good line on it is not. There is a test for each direction.
+It was a weight first, and the first real run showed why that was wrong. A very
+calm moment in the gap between two words outscored every moment with words on
+screen, and the cover came out blank while the report cheerfully recorded which
+line was supposed to be on it.
+
+That run exposed a second thing, and it is the more interesting one. A caption
+chunk looks like a continuous span in the transcript, so the first version
+treated it as one. It is not what ends up on screen: the karaoke effect emits
+one event per word, running from that word's start to its end, so the short gaps
+between words are gaps where nothing is drawn at all. Fifteen covers were
+computed as "has a caption" and one of them was empty. The visible spans are now
+built per word, holding the last word of a chunk until the chunk ends, which is
+exactly what the subtitle builder does, and there is a test that puts a very
+calm keyframe in one of those holes and checks it is not chosen.
+
+### Three attempts at "worth reading"
+
+Judging the line took three tries, and the first two failed the same way: they
+measured something that correlates with a good line instead of the line.
+
+**Length.** The caption style puts two words on screen at a time, so every line
+in a fifteen-clip run came out between 15 and 21 characters. The rule never
+chose between anything. "TRANSAKSI HARIAN" and "MANAJEMEN DALAM" scored
+identically and only one of them reads as a phrase.
+
+**Content words, tokenised.** Better in principle: ask `scoring/signals.py`,
+which already holds the vocabulary the clip scorer uses, so the same word banks
+that decide which moment is worth clipping decide which frame represents it.
+Grammatical glue is discounted, a stakes word is rewarded. But tokenising drops
+numerals, so "Hampir 90" was scored as the single word "hampir", came out
+perfect, and pushed number fragments to the top of eleven of fifteen clips. The
+lines got measurably better and visibly worse, which is the failure mode worth
+naming: the metric improved and the output did not.
+
+**The words a viewer sees.** The denominator is now the words actually on
+screen, and three rules came out of looking at what the second attempt chose:
+
+- a bare numeral counts only when the line gives it a unit, because "16 RIBU" is
+  a thumbnail and "PALING 3" is the middle of a sentence;
+- a lone word is worth half a phrase, after a chunk that held one word put
+  "BEDA." on a cover;
+- a line that repeats itself is halved, because Whisper stumbles and "TERNYATA
+  TERNYATA" is not a thumbnail however well its words score.
+
+Measured against the previous run over the same fifteen clips: seven lines
+better, seven unchanged, one worse. Not a landslide, and the honest reading is
+that this rule is worth having mostly for the clips where the old one had
+nothing to say.
 
 The frame comes out of the rendered clip, not out of the source. That is not an
 optimisation, it is the whole reason the cover matches: the clip has already
@@ -702,7 +746,7 @@ src/ai_clipper/
 data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
-tests/                 232 tests, no video or model files needed
+tests/                 239 tests, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
 transcribe_local.py    transcription, from a clone or from beside the video

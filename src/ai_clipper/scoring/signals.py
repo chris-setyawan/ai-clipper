@@ -61,6 +61,7 @@ class SignalPack:
     # --- general -------------------------------------------------------------
     stopwords: Set[str] = field(default_factory=set)
     filler: Set[str] = field(default_factory=set)
+    weak_words: Set[str] = field(default_factory=set)
 
     # --- numbers that were measured, not guessed -----------------------------
     weights: Dict[str, float] = field(default_factory=dict)
@@ -160,6 +161,24 @@ INDONESIAN = SignalPack(
         "akan", "bisa", "saya", "kamu", "kita", "mereka", "dia", "nya", "loh",
         "sih", "deh", "gua", "gue", "lo", "lu",
     },
+    # Grammatical glue. Kept apart from `stopwords` because the scorer's topic
+    # measurements are calibrated against that bank and adding to it would move
+    # every score in the project. These are only used to judge whether a short
+    # caption line reads as a phrase or as something cut off mid-sentence:
+    # "MARGIN CALL" stands on its own, "MANAJEMEN DALAM" does not.
+    weak_words={
+        "dalam", "pada", "oleh", "akan", "harus", "sampai", "sampe", "buat",
+        "lagi", "ada", "mau", "bikin", "banyak", "semua", "setiap", "antara",
+        "seperti", "supaya", "biar", "waktu", "saat", "hal", "cara", "gini",
+        "begini", "begitu", "sini", "situ", "sana", "tuh", "nih", "kok", "pun",
+        "lah", "dong", "doang", "banget", "aja", "cuma", "cuman", "masih",
+        "belum", "pernah", "sering", "kadang", "agak", "cukup", "sekali",
+        "punya", "dapat", "pakai", "pake", "jangan", "coba", "terlalu",
+        "sedangkan", "sehingga", "namun", "meskipun", "walaupun", "ketika",
+        "serta", "maupun", "bahkan", "kemudian", "selain", "tanpa", "hingga",
+        "bagi", "tentang", "terhadap", "menjadi", "secara", "sangat", "lebih",
+        "kurang", "paling", "hanya", "memang", "apabila", "sambil", "berarti",
+    },
     # carries no topic even though it is not a grammatical stopword
     filler={
         "iya", "gitu", "banget", "emang", "terus", "kayak", "udah", "biar",
@@ -199,6 +218,7 @@ ALIASES = {
     "questions": "question_words",
     "openers": "question_openers",
     "not_a_name": "not_names",
+    "weak": "weak_words",
 }
 
 PACKS = {"indonesian": INDONESIAN}
