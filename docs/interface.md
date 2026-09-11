@@ -303,11 +303,107 @@ else is a step boundary.
 
 ## Calling it from Python
 
-`ai_clipper.cli.pipeline.main()` reads `sys.argv` and prints to stdout. It is a
-command, not an API. Running the pipeline in-process today means setting
-`sys.argv` and capturing stdout, which works but is not pleasant.
+The pipeline is a function. `cli/pipeline.py` reads the arguments and prints;
+everything it does is in `ai_clipper.core`, which prints nothing and has a test
+that says so.
 
-The pieces underneath it are ordinary functions and are the better target:
+```python
+from ai_clipper.core import Settings, run
+
+def on_progress(event):
+    print(event.kind, event.data)
+
+result = run(Settings(video="podcast.mov", transcript="transcript.json",
+                      out="out", clips=15),
+             on_progress=on_progress,
+             should_stop=lambda: user_pressed_stop)
+```
+
+`Settings` has one field per command-line option, with the same names and the
+same defaults, and a test checks the two do not drift. `Settings.from_args()`
+builds one from an argparse namespace and ignores fields it does not recognise.
+
+`run()` returns a `Result`:
+
+| field | what it is |
+|---|---|
+| `out_dir` | where everything was written |
+| `seconds` | how long the run took |
+| `dry_run` | whether the video was ever opened |
+| `cancelled` | whether `should_stop` ended it early |
+| `rendered` | filenames this run encoded, in order |
+| `numbers` | the clip numbers in play |
+| `report` | the contents of `run_report.json`, or None on a dry run |
+| `preview` | the contents of `dry_run.json`, or None on a real run |
+
+A run that cannot start raises `PipelineError` with a message meant for a user:
+an unknown caption style, or `--regenerate` with no previous run to reject from.
+Those used to be `SystemExit`, which ends a command tidily and kills anything
+holding a window open.
+
+### Progress events
+
+`on_progress` is called with an `Event` at every point the command prints.
+
+```python
+Event(kind="rendering",
+      message="  [3/45] clip_02_tiktok.mp4 (62s)  about 13m left",
+      data={"index": 3, "total": 45, "file": "clip_02_tiktok.mp4",
+            "clip": 2, "platform": "tiktok", "duration": 62.4})
+```
+
+`message` is the line the terminal wants, indentation and all. `data` is the
+same information as values. The CLI is one function that prints `message`; a UI
+should switch on `kind` and read `data` and ignore `message` entirely.
+
+The kinds, in the order a full run emits them:
+
+| kind | when | useful in `data` |
+|---|---|---|
+| `signals` | a `signals.json` was loaded | `name`, `path` |
+| `transcript` | the transcript was read | `segments`, `words` |
+| `repunctuated` | punctuation was inferred from pauses | `before`, `after` |
+| `session_reset` | the saved selection no longer applies | `reason` |
+| `regenerated` | a clip was replaced | `clip`, `was`, `now`, `score` |
+| `regenerate_skipped` | a named clip could not be replaced | `clip`, `reason` |
+| `regenerate_exhausted` | nothing else fits | `clip` |
+| `selection` | clips were chosen | `scored`, `chosen`, `reserve` |
+| `extended` | clips were run on to finish their subject | `clips` |
+| `openings` | clips were moved to a self-contained opening | `clips` |
+| `preview_clip` | one clip, on a dry run | the whole `dry_run.json` entry |
+| `analysing` / `analysis_cached` | shot and face analysis | `cached` |
+| `measuring_audio` / `loudness` | the level measurement | `integrated`, `true_peak`, `gain`, `filter` |
+| `dead_air` | pauses to be shortened | `clips`, `total` |
+| `shots` | what the analysis found | `shots`, `seats`, `detection_rate` |
+| `framing` | the framing mode and why | `mode`, `reason` |
+| `clip_skipped` | too long for a platform | `clip`, `why` |
+| `recipe_changed` | render settings moved, so everything is stale | |
+| `resuming` | files already done | `done`, `remaining` |
+| `render_start` | the render loop begins | `total` |
+| `rendering` | one file, before it is encoded | `index`, `total`, `file`, `clip`, `platform`, `duration` |
+| `cancelled` | `should_stop` said so | `rendered` |
+| `cover_failed` | one cover could not be written | `clip`, `error` |
+| `covers` | cover frames written | `written`, `confident` |
+| `done` / `summary` | the end | `seconds`, `written`, `clips` |
+
+For a progress bar, `render_start` gives the total and `rendering` gives the
+position. The estimate in `message` appears from the second file onward, because
+one sample is not a rate.
+
+### Stopping
+
+`should_stop` is called before each file and each cover frame. Returning true
+ends the run with `cancelled=True` rather than an exception.
+
+Stopping between files is safe rather than merely tolerable: renders are atomic,
+and the session is written as each file lands, so running again picks up where
+it stopped. Measured on a three-clip render: stopped after two files, no
+`.part.mp4` left behind, and the next run encoded only the third.
+
+### The pieces underneath
+
+`run()` is one way of wiring these together. A UI backend assembling its own is
+a supported use rather than a workaround.
 
 | what you want | where |
 |---|---|
@@ -320,33 +416,30 @@ The pieces underneath it are ordinary functions and are the better target:
 | choose a cover moment | `video.cover.pick_time(crop_path, start, end, words, per_chunk)` |
 | build subtitles | `video.subtitles.build_ass(words, w, h, style)` |
 | render one clip | `video.render.render_clip(src, start, end, out, spec, ass, crop_path)` |
+| cut pieces out of a clip | `render_clip(..., keep_spans=[(a, b), (c, d)])` |
 | per-platform plans and margins | `export.platforms.plan_exports(...)`, `.style_for(style, key)` |
 | titles and hashtags | `export.caption_pack.build_pack(clip, index)` |
 
 None of these print, none of them read `sys.argv`, and all of them are covered
-by the test suite. `cli/pipeline.py` is one way of wiring them together, and a
-UI backend assembling its own is a supported use rather than a workaround.
+by the test suite.
 
 ## What a UI will want that does not exist yet
 
 Listed so the first hour is not spent discovering them.
 
-- **No progress callback.** Render progress is printed, not emitted. Splitting
-  `main()` into an argument parser and a runner that takes a settings object and
-  an `on_progress` function is a small change to `cli/pipeline.py`, and the
-  right one to make before wiring a progress bar to stdout parsing.
-- **No cancellation.** ffmpeg runs to completion per file. A stop button today
-  means killing the process, which is safe: renders are atomic, so a killed run
-  leaves finished files intact and the next run resumes.
 - **Analysis and rendering are one call.** There is no way to ask for the shot
   and face analysis on its own and show it before committing to a render, short
-  of running `--dry-run` first, which skips analysis entirely.
+  of running a dry run first, which skips analysis entirely.
 - **One episode at a time.** No queue, no job ids. Two runs against the same
   output folder will fight over `session.json`.
-- **`--regenerate` needs a previous run.** A UI reject button has to have run
-  the pipeline at least once against that output folder first, or the command
-  exits with an error rather than picking something.
-- **An unknown `--style` is caught late.** The check happens after the shot and
-  face analysis, so a typo costs minutes before it reports. A UI should validate
-  the style against `subtitles.load_styles()` before starting the run rather
-  than waiting for the command to fail.
+- **No preview render.** `render_clip` with a short range and
+  `preset="ultrafast"` is a few seconds, but nothing exposes it.
+- **No per-clip overrides.** `render_clip` already accepts `keep_spans` and a
+  per-clip audio filter, which is everything a manual trim-and-volume editor
+  needs, but `run()` decides both itself and takes no instruction from outside.
+- **`--regenerate` needs a previous run.** A reject button has to have run the
+  pipeline at least once against that output folder first, or it raises
+  `PipelineError` rather than picking something.
+- **An unknown style is caught late.** The check happens after the shot and face
+  analysis, so a typo costs minutes before it reports. Validate against
+  `subtitles.load_styles()` before starting the run.

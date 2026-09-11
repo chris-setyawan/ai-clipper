@@ -125,6 +125,27 @@ Every option, every file the run writes and the shape of each JSON in it are in
 [docs/interface.md](docs/interface.md). That is the reference for building
 something against this rather than reading the source first.
 
+The command is a thin shell around a function, so a UI does not have to read
+printed lines back:
+
+```python
+from ai_clipper.core import Settings, run
+
+result = run(Settings(video="podcast.mov", transcript="transcript.json", clips=15),
+             on_progress=lambda event: print(event.kind, event.data),
+             should_stop=lambda: user_pressed_stop)
+```
+
+`core.py` prints nothing, and there is a test that says so. Every point the
+command prints is an event carrying both the line a terminal wants and the
+numbers a program wants, so `cli/pipeline.py` is one function that prints
+`event.message` while a UI switches on `event.kind` and reads `event.data`.
+
+Stopping is asked between files rather than forced. Renders are atomic and the
+session is written as each file lands, so a stopped run is a resumable one:
+measured on a three-clip render, stopping after two left no partial file behind
+and the next run encoded only the third.
+
 To look at scoring on its own, with no video and no model:
 
 ```bash
@@ -718,6 +739,7 @@ damaged were left alone.
 
 ```
 src/ai_clipper/
+  core.py              the pipeline as a function: settings in, events out
   scoring/
     hook_scorer.py     transcript -> ranked, explained clip candidates
     signals.py         the word lists and weights, swappable per language
@@ -751,7 +773,7 @@ data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
 docs/interface.md      commands, output files and their JSON, for building against it
-tests/                 239 tests, no video or model files needed
+tests/                 250 tests, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
 transcribe_local.py    transcription, from a clone or from beside the video
