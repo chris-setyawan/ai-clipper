@@ -21,9 +21,28 @@ from ..scoring.hook_scorer import TranscriptSegment
 
 @dataclass
 class Word:
+    """
+    One word, with how sure the model was about it.
+
+    `confidence` is 0 to 1 and comes free with word timestamps: the model
+    already computes it and the first version of this class threw it away.
+    Keeping it is what lets a caption editor point at the eight words in a clip
+    worth a second look instead of making a person read all two hundred.
+
+    It is also the honest version of a "fix my typos" button. Guessing a
+    correction needs a model and gets it wrong in ways nobody notices; saying
+    "the transcriber was unsure here" is something the transcriber actually
+    knows.
+
+    Defaults to 1.0 so a transcript written before this existed loads as a
+    transcript nothing was flagged in, rather than one where every word looks
+    suspect.
+    """
+
     start: float
     end: float
     text: str
+    confidence: float = 1.0
 
 
 def extract_audio(video_path: str, out_path: Optional[str] = None) -> str:
@@ -98,7 +117,13 @@ class Transcriber:
                     )
                 )
                 for w in (seg.words or []):
-                    words.append(Word(start=float(w.start), end=float(w.end), text=w.word.strip()))
+                    words.append(Word(
+                        start=float(w.start), end=float(w.end),
+                        text=w.word.strip(),
+                        # some builds do not report it; a missing value is not
+                        # the same as a value of zero
+                        confidence=round(float(getattr(w, "probability", 1.0) or 1.0), 4),
+                    ))
 
             self.detected_language = info.language
             self.duration = info.duration
@@ -106,6 +131,31 @@ class Transcriber:
         finally:
             if needs_cleanup and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+# Below this, the model was not sure. Starting point, not a measurement: the
+# transcripts this project was built on predate the confidence being saved, so
+# nobody has yet looked at where the real line falls on Indonesian conversation.
+# Worth revisiting once an episode has been transcribed with it and the flagged
+# words compared against what was actually wrong.
+UNSURE_BELOW = 0.6
+
+
+def uncertain(words, below: float = UNSURE_BELOW) -> list:
+    """
+    The words worth a second look, lowest confidence first.
+
+    This is the whole of the "fix my typos" feature, and deliberately so. It
+    does not propose a correction, because proposing one needs a model and gets
+    it wrong in ways nobody checks. It points at the words the transcriber
+    itself was unsure about, which is something the transcriber actually knows,
+    and leaves the fixing to the person who can hear the audio.
+
+    Words carrying no confidence score, which is every word in a transcript
+    written before it was saved, are never flagged.
+    """
+    flagged = [w for w in words if getattr(w, "confidence", 1.0) < below]
+    return sorted(flagged, key=lambda w: getattr(w, "confidence", 1.0))
 
 
 def segments_to_json(segments, words=None) -> dict:

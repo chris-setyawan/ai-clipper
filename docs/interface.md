@@ -34,12 +34,19 @@ The transcript it writes is the second argument to the pipeline:
 ```json
 {
   "segments": [{"start": 31.04, "end": 34.9, "text": "Makanya agak unik..."}],
-  "words":    [{"start": 31.04, "end": 31.3, "text": "Makanya"}]
+  "words":    [{"start": 31.04, "end": 31.3, "text": "Makanya",
+                "confidence": 0.94}]
 }
 ```
 
 Both lists are required. Word timings drive the karaoke captions, the dead air
 plan and the cover choice, so a transcript without them will not work.
+
+`confidence` is 0 to 1 and is what the model reported for that word.
+`transcriber.uncertain(words, below=0.6)` returns the ones worth a second look,
+least certain first, which is the whole of the typo feature: it points, it does
+not correct. A transcript written before confidence was saved has none, and
+loads as one where nothing is flagged rather than one where everything is.
 
 ### The pipeline
 
@@ -400,6 +407,32 @@ and the session is written as each file lands, so running again picks up where
 it stopped. Measured on a three-clip render: stopped after two files, no
 `.part.mp4` left behind, and the next run encoded only the third.
 
+### Analysis on its own
+
+```python
+found = core.analyse(video, out_dir, mode="auto", on_progress=on_progress)
+found.summary()
+# {"shots": 291, "seats": 1, "face_detection_rate": 1.0,
+#  "mode": "per_shot", "reason": "shots change every 6.0s on average...",
+#  "cached": False}
+```
+
+The slow part of a first run, several minutes on a long episode, available
+without committing to a render. Cached in the output folder, so calling this and
+then running costs it once. `run()` calls the same function.
+
+`found.crop_path` and `found.seats` are the objects the renderer wants, if a
+caller is assembling its own pipeline.
+
+### One run at a time
+
+`run()` holds a lock file in the output folder and raises `Busy`, a subclass of
+`PipelineError`, when another run already has it. A lock older than six hours is
+taken over. The lock is released even when the run fails or is cancelled.
+
+Worth telling apart from other failures in a UI: nothing is broken, something
+else is using the folder.
+
 ### Editing a clip
 
 `run()` takes a second argument: `edits`, clip number to a dict. It is how a
@@ -497,6 +530,8 @@ a supported use rather than a workaround.
 | the source behind a moment of a clip | `video.deadair.slice_of(timeline, a, b)` |
 | per-platform plans and margins | `export.platforms.plan_exports(...)`, `.style_for(style, key)` |
 | titles and hashtags | `export.caption_pack.build_pack(clip, index)` |
+| shots, faces and framing mode | `core.analyse(video, out_dir, mode)` |
+| words worth checking | `asr.transcriber.uncertain(words, below)` |
 
 None of these print, none of them read `sys.argv`, and all of them are covered
 by the test suite.
@@ -505,11 +540,10 @@ by the test suite.
 
 Listed so the first hour is not spent discovering them.
 
-- **Analysis and rendering are one call.** There is no way to ask for the shot
-  and face analysis on its own and show it before committing to a render, short
-  of running a dry run first, which skips analysis entirely.
-- **One episode at a time.** No queue, no job ids. Two runs against the same
-  output folder will fight over `session.json`.
+- **One episode at a time.** There is no queue and no job ids. Two runs against
+  the same output folder are refused rather than allowed to corrupt each other,
+  which is a guard, not a scheduler: a UI that wants to queue two episodes has
+  to hold the queue itself.
 - **No multi-track, transitions, background music or video effects.** Deliberate.
   That is a different project, not a larger version of this one.
 - **No translation.** `--language` transcribes in any language Whisper knows;

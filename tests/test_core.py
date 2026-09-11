@@ -237,3 +237,58 @@ def test_clips_nobody_edited_are_untouched(tmp_path):
         if now["clip"] == target:
             continue
         assert (was["start"], was["end"]) == (now["start"], now["end"])
+
+
+# --- one run at a time -------------------------------------------------------
+
+def test_a_second_run_on_the_same_folder_is_refused(tmp_path):
+    """
+    Two runs against one folder both write session.json, and the loser does not
+    fail, it corrupts: clip numbers from one and rendered files from the other.
+    Nothing catches that afterwards, which is why it is a lock and not a
+    convention.
+    """
+    from ai_clipper.core import Busy, LOCK
+
+    settings = dry(tmp_path)
+    Path(settings.out).mkdir(parents=True, exist_ok=True)
+    (Path(settings.out) / LOCK).write_text("{}")
+
+    with pytest.raises(Busy):
+        run(settings)
+
+
+def test_busy_is_something_a_ui_can_tell_apart(tmp_path):
+    """Nothing is wrong here, so it should not read like a broken run."""
+    from ai_clipper.core import Busy
+    assert issubclass(Busy, PipelineError)
+
+
+def test_a_lock_left_by_a_run_that_never_came_back_is_taken_over(tmp_path):
+    import os
+    from ai_clipper.core import LOCK
+
+    settings = dry(tmp_path)
+    Path(settings.out).mkdir(parents=True, exist_ok=True)
+    stale = Path(settings.out) / LOCK
+    stale.write_text("{}")
+    os.utime(stale, (0, 0))
+
+    assert run(settings).preview
+
+
+def test_the_lock_is_released_even_when_the_run_fails(tmp_path):
+    from ai_clipper.core import LOCK
+
+    settings = dry(tmp_path, regenerate="2")
+    with pytest.raises(PipelineError):
+        run(settings)
+    assert not (Path(settings.out) / LOCK).exists()
+
+
+def test_the_lock_does_not_outlive_a_finished_run(tmp_path):
+    from ai_clipper.core import LOCK
+
+    settings = dry(tmp_path)
+    run(settings)
+    assert not (Path(settings.out) / LOCK).exists()

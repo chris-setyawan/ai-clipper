@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
 import time
 from dataclasses import dataclass, field
@@ -235,6 +236,130 @@ def eta(started: float, done: int, total: int) -> str:
     return f"  about {left / 60:.0f}m left"
 
 
+class Busy(PipelineError):
+    """
+    Another run already has this output folder.
+
+    Its own exception rather than a message, because a UI wants to say
+    something different here than for a bad style: nothing is wrong, something
+    else is simply using it.
+    """
+
+
+LOCK = ".lock"
+
+# A lock older than this belonged to a run that is not coming back. Generous,
+# because a three-hour episode across six platforms is a long time to hold one.
+STALE_AFTER = 6 * 3600
+
+
+def _take_lock(out_dir: Path) -> Optional[Path]:
+    """
+    Claim an output folder, or say who has it.
+
+    Two runs against the same folder both write `session.json`, and the loser
+    does not fail, it corrupts: clip numbers from one run and rendered files
+    from the other. Nothing catches that afterwards, which is exactly why it is
+    worth a lock file rather than a convention.
+
+    Created with O_EXCL, which is atomic on Windows and POSIX alike, so two
+    processes starting together cannot both believe they won.
+    """
+    path = out_dir / LOCK
+    try:
+        handle = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        age = time.time() - path.stat().st_mtime if path.exists() else STALE_AFTER
+        if age < STALE_AFTER:
+            raise Busy(
+                f"{out_dir} is already being used by another run "
+                f"(started {age / 60:.0f} minutes ago). Wait for it to finish, "
+                f"or use a different output folder. If you are sure nothing is "
+                f"running, delete {path}."
+            )
+        # whoever held this is long gone
+        path.unlink(missing_ok=True)
+        handle = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+
+    with os.fdopen(handle, "w") as f:
+        f.write(json.dumps({"pid": os.getpid(), "at": time.time()}))
+    return path
+
+
+@dataclass
+class Analysis:
+    """What one pass over the frames found, and what it implies for framing."""
+
+    crop_path: object
+    seats: List
+    mode: str
+    reason: str
+    cached: bool
+
+    def summary(self) -> Dict:
+        """The part a UI can show before anyone commits to a render."""
+        return {
+            "shots": len(self.crop_path.shots),
+            "seats": len(self.seats),
+            "face_detection_rate": round(self.crop_path.detection_rate, 3),
+            "mode": self.mode,
+            "reason": self.reason,
+            "cached": self.cached,
+        }
+
+
+def analyse(video: str, out_dir, mode: str = "auto",
+            on_progress: Optional[Callable[[Event], None]] = None) -> Analysis:
+    """
+    Find the shots and the faces, and decide how to frame.
+
+    Split out of `run()` so it can be asked for on its own. It is the slow part
+    of a first run, several minutes on a long episode, and a UI that can show
+    "291 shots, one person, faces in every sampled frame, so per_shot" before
+    anyone presses Render is a different experience from one that goes quiet.
+
+    The result is cached in the output folder, so calling this and then running
+    costs the analysis once, not twice.
+    """
+    from .video.framing import build_crop_path, recommend_mode
+    from .video.speakers import find_seats
+
+    emit = on_progress or (lambda event: None)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cache = out_dir / "analysis.pkl"
+    cached = cache.exists()
+    if cached:
+        crop_path, seats = pickle.loads(cache.read_bytes())
+        emit(Event("analysis_cached", "Reusing cached video analysis",
+                   {"cached": True}))
+    else:
+        emit(Event("analysing", "Analysing shots and faces ...", {"cached": False}))
+        crop_path = build_crop_path(video)
+        seats = find_seats(video)
+        cache.write_bytes(pickle.dumps((crop_path, seats)))
+
+    chosen, reason = recommend_mode(crop_path)
+    if mode != "auto":
+        chosen, reason = mode, "chosen on the command line"
+    elif len(seats) >= 2 and len(crop_path.shots) <= 3:
+        # a static camera holding two people is exactly the split-view case
+        chosen, reason = "split", (
+            f"{len(seats)} people in a single unbroken shot - split-view shows both"
+        )
+
+    found = Analysis(crop_path, seats, chosen, reason, cached)
+    emit(Event("shots",
+               f"  {len(crop_path.shots)} shots, {len(seats)} seats, "
+               f"faces in {crop_path.detection_rate * 100:.0f}% of frames",
+               {k: v for k, v in found.summary().items()
+                if k in ("shots", "seats", "face_detection_rate")}))
+    emit(Event("framing", f"  framing mode: {chosen} ({reason})",
+               {"mode": chosen, "reason": reason}))
+    return found
+
+
 def run(settings: Settings,
         edits: Optional[Dict] = None,
         on_progress: Optional[Callable[[Event], None]] = None,
@@ -247,9 +372,24 @@ def run(settings: Settings,
     cut out of the middle, a volume, hand-styled captions. Clips it does not
     name are untouched.
 
-    Raises PipelineError for a run that cannot start. Everything else is
-    reported through `on_progress` and returned in the Result.
+    Raises PipelineError for a run that cannot start, and `Busy` when another
+    run already holds the output folder. Everything else is reported through
+    `on_progress` and returned in the Result.
     """
+    out_dir = Path(settings.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lock = _take_lock(out_dir)
+    try:
+        return _run(settings, edits, on_progress, should_stop)
+    finally:
+        if lock is not None:
+            lock.unlink(missing_ok=True)
+
+
+def _run(settings: Settings,
+         edits: Optional[Dict],
+         on_progress: Optional[Callable[[Event], None]],
+         should_stop: Optional[Callable[[], bool]]) -> Result:
     emit = on_progress or (lambda event: None)
     edits = as_edits(edits)
 
@@ -467,19 +607,16 @@ def run(settings: Settings,
                       numbers=numbers, preview=preview)
 
     # --- analyse the video once ----------------------------------------------
-    from .video.framing import build_crop_path, recommend_mode
+    # The analysis itself lives in analyse(), so a UI can ask for it on its own
+    # and show what it found before anyone commits to a render. Its events are
+    # emitted from in there, which is why the mode is reported before the dead
+    # air plan rather than after it.
     from .video.render import RenderSpec, render_clip, target_size
-    from .video.speakers import find_seats, seats_for_range
+    from .video.speakers import seats_for_range
 
-    cache = out_dir / "analysis.pkl"
-    if cache.exists():
-        crop_path, seats = pickle.loads(cache.read_bytes())
-        say("analysis_cached", "Reusing cached video analysis", cached=True)
-    else:
-        say("analysing", "Analysing shots and faces ...", cached=False)
-        crop_path = build_crop_path(video)
-        seats = find_seats(video)
-        cache.write_bytes(pickle.dumps((crop_path, seats)))
+    found = analyse(video, out_dir, settings.mode, on_progress)
+    crop_path, seats = found.crop_path, found.seats
+    mode, reason = found.mode, found.reason
 
     # One measurement for the episode, reused by every clip cut from it, so the
     # quiet moments stay quieter than the loud ones. Cached separately from the
@@ -531,21 +668,6 @@ def run(settings: Settings,
                 f"{total:.0f}s in total",
                 clips={i: round(t.removed, 2) for i, t in sorted(cut.items())},
                 total=round(total, 2))
-
-    mode, reason = recommend_mode(crop_path)
-    if settings.mode != "auto":
-        mode, reason = settings.mode, "chosen on the command line"
-    elif len(seats) >= 2 and len(crop_path.shots) <= 3:
-        # a static camera holding two people is exactly the split-view case
-        mode, reason = "split", (
-            f"{len(seats)} people in a single unbroken shot - split-view shows both"
-        )
-    say("shots",
-        f"  {len(crop_path.shots)} shots, {len(seats)} seats, "
-        f"faces in {crop_path.detection_rate * 100:.0f}% of frames",
-        shots=len(crop_path.shots), seats=len(seats),
-        detection_rate=round(crop_path.detection_rate, 3))
-    say("framing", f"  framing mode: {mode} ({reason})", mode=mode, reason=reason)
 
     # --- render --------------------------------------------------------------
     styles = load_styles(settings.styles_file if Path(settings.styles_file).exists() else None)

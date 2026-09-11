@@ -588,6 +588,65 @@ the clip has pieces cut out of it those six seconds can come from two places in
 the source, and they do. Measured: 1.6s for a plain five-second preview, 3.0s
 for one that spans a cut.
 
+## One test that actually renders
+
+Every other test works on data, which is why the suite runs in two seconds. It
+also leaves a whole class of bug uncovered, and not a theoretical one: a glow
+that erased the word behind it, a caption landing in a hole between two words, a
+filter chain ffmpeg rejects. Each of those was caught by a person looking at a
+frame, which does not scale and does not run anywhere but on a desk.
+
+`tests/test_render_smoke.py` builds a three-second video out of ffmpeg's own
+test source, cuts a clip from it with captions burned in, and checks the result
+is a playable file with both streams and roughly the right length. It renders
+every animation, the glow, a clip cut into two pieces and joined, the loudness
+chain, and a cover frame. Thirteen seconds, and it is skipped when ffmpeg is not
+on the PATH.
+
+It will not tell you a caption is ugly. It tells you the chain still works,
+which is the part a refactor breaks.
+
+## One run at a time
+
+Two runs against the same output folder both write `session.json`, and the loser
+does not fail, it corrupts: clip numbers from one run and rendered files from
+the other, with nothing afterwards to catch it. So a run holds a lock file for
+the folder, created with `O_EXCL` so two processes starting together cannot both
+believe they won.
+
+A lock more than six hours old belonged to a run that is not coming back and is
+taken over. The exception is its own type, `Busy`, because a UI should say
+something different here than for a bad style: nothing is broken, something else
+is simply using it.
+
+## Analysis on its own
+
+Finding the shots and the faces is the slow part of a first run, several minutes
+on a long episode, and it used to be locked inside the render. `core.analyse()`
+does it alone and returns what it found, so a UI can show "291 shots, one
+person, faces in every sampled frame, so per_shot" before anyone commits.
+
+The result is cached in the output folder, so asking for it and then rendering
+costs the analysis once rather than twice. `run()` calls the same function,
+which is what keeps the two from drifting.
+
+## Words the transcriber was unsure about
+
+faster-whisper reports a confidence for every word, and the first version of the
+transcript threw it away. It is kept now, and that turns a "fix my typos" button
+into something more honest: `transcriber.uncertain()` returns the words the
+model itself was least sure of, lowest first.
+
+It proposes no corrections. Proposing one needs a model and gets it wrong in
+ways nobody checks, while "the transcriber was unsure here" is something the
+transcriber actually knows. Eight highlighted words in a caption editor beats an
+automatic fix that quietly replaces a name.
+
+The threshold is a starting point rather than a measurement, and says so in the
+code: the episodes this project was built on were transcribed before the
+confidence was saved, so nobody has yet compared what gets flagged against what
+was actually wrong. That is a job for the next episode.
+
 ## Regenerating clips
 
 The scorer keeps its whole ranked pool, not just the clips it picked, so
@@ -879,7 +938,7 @@ data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
 docs/interface.md      commands, output files and their JSON, for building against it
-tests/                 284 tests, no video or model files needed
+tests/                 303 tests, one of which renders, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
 transcribe_local.py    transcription, from a clone or from beside the video
