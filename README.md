@@ -121,6 +121,10 @@ the audio was moved by.
 The video analysis is cached in the output folder, so re-running with different
 platforms, styles or clip counts skips straight to rendering.
 
+Every option, every file the run writes and the shape of each JSON in it are in
+[docs/interface.md](docs/interface.md). That is the reference for building
+something against this rather than reading the source first.
+
 To look at scoring on its own, with no video and no model:
 
 ```bash
@@ -746,6 +750,7 @@ src/ai_clipper/
 data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
+docs/interface.md      commands, output files and their JSON, for building against it
 tests/                 239 tests, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
