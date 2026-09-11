@@ -156,7 +156,7 @@ class Session:
         self.slots = [Slot(n, k, c.start, c.end) for n, k, c in entries]
         self.rejected = sorted({tuple(r) for r in rejected})
 
-    def is_current(self, filename: str, clip) -> bool:
+    def is_current(self, filename: str, clip, edit: str = "") -> bool:
         """
         Whether the file on disk was encoded from exactly this clip.
 
@@ -172,10 +172,28 @@ class Session:
         is what gets recorded, per file, at the moment ffmpeg succeeds.
         """
         was = self.rendered.get(filename)
-        return was is not None and tuple(was) == (round(clip.start, 2), round(clip.end, 2))
+        if was is None:
+            return False
+        return tuple(was) == self._stamp(clip, edit)
 
-    def mark_rendered(self, filename: str, clip) -> None:
-        self.rendered[filename] = (round(clip.start, 2), round(clip.end, 2))
+    def mark_rendered(self, filename: str, clip, edit: str = "") -> None:
+        self.rendered[filename] = self._stamp(clip, edit)
+
+    @staticmethod
+    def _stamp(clip, edit: str = "") -> Tuple:
+        """
+        What a file was made from: its boundaries, and whatever else was done
+        to it.
+
+        `edit` is a short fingerprint of a per-clip edit - spans cut out of the
+        middle, a volume change, hand-styled captions. Boundaries alone stopped
+        being enough the moment a person could change a clip without moving its
+        ends. An entry written before this existed has two values and no
+        fingerprint, and compares equal to an unedited clip, so upgrading does
+        not re-render an episode.
+        """
+        base = (round(clip.start, 2), round(clip.end, 2))
+        return base if not edit else base + (edit,)
 
     def forget_rendered(self, keep: Sequence[str]) -> None:
         """Drop records for files this run is no longer producing."""

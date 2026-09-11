@@ -28,6 +28,7 @@ Nothing here prints. That is the whole point, and it is worth keeping true.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pickle
 import time
@@ -100,6 +101,80 @@ class Settings:
         return cls(**{k: v for k, v in vars(args).items() if k in known})
 
 
+@dataclass
+class ClipEdit:
+    """
+    What a person changed about one clip after watching it.
+
+    Everything here is optional and everything is in source time, the same
+    coordinates the run report uses, so a UI can take a number straight out of
+    `run_report.json`, change it, and hand it back.
+
+    The renderer already knew how to do all of this. Trimming is a different
+    start and end; cutting a bad patch out of the middle is the mechanism dead
+    air removal was built on; a per-clip volume is the audio filter the loudness
+    step already sets. What was missing was a way to say so from outside.
+
+        ClipEdit(start=31.5, keep_spans=[[31.5, 60.0], [64.0, 97.2]],
+                 gain_db=-3.0)
+    """
+
+    start: Optional[float] = None
+    end: Optional[float] = None
+    # ranges of the source to keep, in order. Absolute, not relative to start.
+    keep_spans: Optional[List[List[float]]] = None
+    gain_db: Optional[float] = None
+    # replacement caption words, each {"start", "end", "text", "style"}
+    words: Optional[List[Dict]] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ClipEdit":
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+    def fingerprint(self) -> str:
+        """
+        A short, stable stamp of this edit.
+
+        It goes next to the boundaries in the session so that a file made with
+        an edit is not mistaken for one made without it. Boundaries alone stopped
+        being enough the moment someone could change a clip without moving its
+        ends: a volume change and a hand-styled caption both leave start and end
+        exactly where they were.
+
+        Per clip rather than per run, because editing clip 3 should re-render
+        clip 3 and leave the other fourteen alone.
+        """
+        if self == ClipEdit():
+            return ""
+        payload = json.dumps({
+            "start": self.start, "end": self.end,
+            "keep_spans": self.keep_spans, "gain_db": self.gain_db,
+            "words": self.words,
+        }, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+    def caption_words(self) -> Optional[List[Word]]:
+        """The replacement words as the subtitle builder wants them."""
+        if self.words is None:
+            return None
+        return [Word(float(w["start"]), float(w["end"]), str(w["text"]),
+                     w.get("style")) for w in self.words]
+
+
+def as_edits(raw: Optional[Dict]) -> Dict[int, ClipEdit]:
+    """
+    Accept edits as clip number to dict, which is what arrives over HTTP.
+
+    Keys come back as strings from JSON, so they are coerced here rather than at
+    every use.
+    """
+    if not raw:
+        return {}
+    return {int(k): (v if isinstance(v, ClipEdit) else ClipEdit.from_dict(v))
+            for k, v in raw.items()}
+
+
 @dataclass(frozen=True)
 class Event:
     """
@@ -161,15 +236,22 @@ def eta(started: float, done: int, total: int) -> str:
 
 
 def run(settings: Settings,
+        edits: Optional[Dict] = None,
         on_progress: Optional[Callable[[Event], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None) -> Result:
     """
     Pick clips out of an episode and render them.
 
+    `edits` is clip number to `ClipEdit`, or to a plain dict of the same shape.
+    It is how a person's changes get back in: a different start and end, a patch
+    cut out of the middle, a volume, hand-styled captions. Clips it does not
+    name are untouched.
+
     Raises PipelineError for a run that cannot start. Everything else is
     reported through `on_progress` and returned in the Result.
     """
     emit = on_progress or (lambda event: None)
+    edits = as_edits(edits)
 
     def say(kind: str, message: str, **data) -> None:
         emit(Event(kind, message, data))
@@ -340,6 +422,31 @@ def run(settings: Settings,
                 + ", ".join(f"#{k} +{v:.0f}s in" for k, v in sorted(openings.items())),
                 clips=dict(sorted(openings.items())))
 
+    # --- what a person changed -----------------------------------------------
+    # Applied after extension and opening adjustment, so a hand-set boundary is
+    # the last word rather than something the topic model gets to move again.
+    trimmed = {}
+    for i, number in enumerate(numbers):
+        edit = edits.get(number)
+        if not edit or (edit.start is None and edit.end is None):
+            continue
+        clip = selection.chosen[i]
+        start = clip.start if edit.start is None else float(edit.start)
+        end = clip.end if edit.end is None else float(edit.end)
+        if end - start < 1.0:
+            raise PipelineError(
+                f"clip {number} would be {end - start:.1f}s long. "
+                f"Check the start and end you sent."
+            )
+        clip.start, clip.end = start, end
+        clip.segments = [s for s in segments if s.start >= start and s.end <= end]
+        trimmed[number] = [round(start, 2), round(end, 2)]
+    if trimmed:
+        say("trimmed",
+            f"Using hand-set boundaries for {len(trimmed)} clips: "
+            + ", ".join(f"#{k}" for k in sorted(trimmed)),
+            clips=trimmed)
+
     # --- boundaries only, no video -------------------------------------------
     # Rendering 15 clips across three platforms takes about fourteen minutes,
     # and every question about a clip's boundaries ("does it stop too early?")
@@ -405,8 +512,16 @@ def run(settings: Settings,
 
     min_gap = deadair.MIN_GAP if settings.min_gap is None else settings.min_gap
     timelines = {}
+    for i, clip in zip(numbers, selection.chosen):
+        # A hand-cut clip is not up for automatic trimming. Someone has already
+        # said which parts of it they want.
+        spans = edits[i].keep_spans if i in edits else None
+        if spans:
+            timelines[i] = deadair.from_spans(spans, clip.start, clip.end)
     if not settings.no_trim_silence:
         for i, clip in zip(numbers, selection.chosen):
+            if i in timelines:
+                continue
             timelines[i] = deadair.plan(words, clip.start, clip.end, min_gap=min_gap)
         cut = {i: t for i, t in timelines.items() if t.cuts}
         if cut:
@@ -485,7 +600,9 @@ def run(settings: Settings,
     # be present but stale after a regeneration.
     plans = [p for p in all_plans
              if not (out_dir / p.filename).exists()
-             or not session.is_current(p.filename, by_number[p.clip_index])]
+             or not session.is_current(
+                 p.filename, by_number[p.clip_index],
+                 edits.get(p.clip_index, ClipEdit()).fingerprint())]
     already = len(all_plans) - len(plans)
     if already:
         say("resuming",
@@ -511,13 +628,23 @@ def run(settings: Settings,
             if stopping():
                 raise _Stopped
             clip = by_number[plan.clip_index]
+            edit = edits.get(plan.clip_index, ClipEdit())
+            # A hand-set volume replaces the episode-wide match for this clip
+            # only. Everything else keeps the level the loudness step chose.
+            clip_audio = (f"volume={float(edit.gain_db):.2f}dB"
+                          if edit.gain_db is not None else audio_filter)
             spec = RenderSpec(ratio=plan.ratio, resolution=plan.resolution,
-                              mode=mode, audio_filter=audio_filter)
+                              mode=mode, audio_filter=clip_audio)
             out_w, out_h = target_size(spec)
 
             style = (styles[settings.style] if settings.no_safe_area
                      else plat.style_for(styles[settings.style], plan.platform.key))
-            clip_words = [w for w in words if w.end > clip.start and w.start < clip.end]
+            # Edited captions replace the transcript's, text and per-word
+            # styling together, and are otherwise treated identically: they are
+            # still cut to the clip and still moved onto the shortened timeline.
+            source_words = edit.caption_words() or words
+            clip_words = [w for w in source_words
+                          if w.end > clip.start and w.start < clip.end]
             # the same line the caption pack files under TITLE, so what is on the
             # screen and what is in the copy cannot drift apart
             title = build_pack(clip, plan.clip_index).title if settings.title else None
@@ -551,7 +678,7 @@ def run(settings: Settings,
             rendered.append(plan.filename)
             # recorded as each file lands, so an interrupted run resumes from the
             # last finished file rather than the last finished run
-            session.mark_rendered(plan.filename, clip)
+            session.mark_rendered(plan.filename, clip, edit.fingerprint())
             session.save(out_dir)
     except _Stopped:
         cancelled = True
@@ -626,6 +753,7 @@ def run(settings: Settings,
             "dead_air_removed": round(timelines[plan.clip_index].removed, 2)
                                 if plan.clip_index in timelines else 0,
             "cover_at": covers.get(plan.clip_index),
+            "edited": bool(edits.get(plan.clip_index, ClipEdit()).fingerprint()),
             "score": clip.score,
             "raw_score": round(clip.raw_score, 2),
             "percentile": clip.percentile,
@@ -709,3 +837,76 @@ def _preview(selection, numbers, extensions, openings, say) -> List[Dict]:
             **entry)
         preview.append(entry)
     return preview
+
+
+def preview(video: str, start: float, end: float, out_path: str,
+            words: Optional[List] = None,
+            style=None,
+            edit: Optional[ClipEdit] = None,
+            seconds: float = 6.0,
+            at: float = 0.0,
+            ratio: str = "9:16",
+            resolution: str = "720p",
+            mode: str = "crop",
+            crop_path=None,
+            seats=None,
+            platform: Optional[str] = None) -> str:
+    """
+    Render a few seconds of one clip, quickly, to show an edit before committing.
+
+    Deliberately takes plain numbers rather than a Settings and a clip number.
+    Everything it needs is already in `run_report.json`, so a UI that has just
+    shown someone a clip can call this without the pipeline re-deriving a
+    selection it already made.
+
+    `at` and `seconds` are in clip time, which is what a person is looking at:
+    "the bit six seconds in" means six seconds into the clip, not into the
+    episode. When the clip has pieces cut out of it, those six seconds can come
+    from two places in the source, and they do.
+
+    Encoded at `ultrafast` and a loose quality, because this is for judging a
+    cut and a caption, not for posting.
+    """
+    from .video import deadair
+    from .video.render import RenderSpec, render_clip, target_size
+
+    style = style or load_styles(None)["punch"]
+    if platform:
+        style = plat.style_for(style, platform)
+
+    edit = edit or ClipEdit()
+    timeline = (deadair.from_spans(edit.keep_spans, start, end)
+                if edit.keep_spans else deadair.from_spans([[start, end]], start, end))
+
+    window = max(0.5, min(seconds, timeline.duration - at))
+    spans = deadair.slice_of(timeline, at, at + window)
+    if not spans:
+        raise PipelineError(
+            f"nothing to preview: {at:.1f}s is past the end of a "
+            f"{timeline.duration:.1f}s clip"
+        )
+
+    spec = RenderSpec(ratio=ratio, resolution=resolution, mode=mode,
+                      preset="ultrafast", crf=28,
+                      audio_filter=(f"volume={float(edit.gain_db):.2f}dB"
+                                    if edit.gain_db is not None else None))
+    out_w, out_h = target_size(spec)
+
+    source_words = edit.caption_words() if edit.words is not None else (words or [])
+    inside = [w for w in source_words if w.end > start and w.start < end]
+    # onto the cut timeline, then back by the part of the clip being skipped, so
+    # the preview's own first frame is time zero
+    moved = [
+        Word(w.start - at, w.end - at, w.text, w.style)
+        for w in deadair.shift_words(inside, timeline)
+    ]
+
+    ass_path = str(Path(out_path).with_suffix(".ass"))
+    Path(ass_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(ass_path).write_text(
+        build_ass(moved, out_w, out_h, style, clip_start=0.0), encoding="utf-8")
+
+    render_clip(video, spans[0][0], spans[-1][1], out_path, spec, ass_path,
+                crop_path, seats,
+                keep_spans=spans if len(spans) > 1 else None)
+    return out_path

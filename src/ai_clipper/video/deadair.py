@@ -104,6 +104,30 @@ class Timeline:
         return elapsed
 
 
+def slice_of(timeline: "Timeline", a: float, b: float) -> List[Tuple[float, float]]:
+    """
+    The source ranges that make up clip time `a` to `b`.
+
+    `remap` goes one way, from the source into the finished clip. This goes the
+    other, and a preview needs it: someone asks for six seconds starting a
+    minute into a clip, and what has to be handed to ffmpeg is the one or two
+    ranges of the original episode those six seconds were cut from.
+    """
+    out, elapsed = [], 0.0
+    for span in timeline.spans:
+        length = span.duration
+        first, last = elapsed, elapsed + length
+        if last <= a or first >= b:
+            elapsed = last
+            continue
+        from_here = span.start + max(0.0, a - first)
+        to_here = span.start + min(length, b - first)
+        if to_here > from_here:
+            out.append((from_here, to_here))
+        elapsed = last
+    return out
+
+
 def _gaps(words: Sequence, start: float, end: float) -> List[Tuple[float, float]]:
     """
     Silent stretches strictly between the first and last word.
@@ -171,21 +195,51 @@ def plan(words: Sequence, start: float, end: float,
     return Timeline(spans, duration)
 
 
-def shift_words(words: Sequence, timeline: Timeline, factory) -> List:
+def from_spans(spans: Sequence, start: float, end: float) -> Timeline:
+    """
+    A timeline someone else decided.
+
+    The gap detector is one way to choose which stretches of a clip survive. A
+    person dragging handles in an editor is another, and the renderer does not
+    care which produced the list. Spans are in source time, the same coordinates
+    `plan` returns, and are clamped to the clip and put in order so a UI cannot
+    hand back something that renders as a negative duration.
+    """
+    kept = []
+    for a, b in spans:
+        a, b = max(float(a), start), min(float(b), end)
+        if b - a > MIN_CUT:
+            kept.append(Span(a, b))
+    kept.sort(key=lambda s: s.start)
+    if not kept:
+        kept = [Span(start, end)]
+    return Timeline(kept, max(0.0, end - start))
+
+
+def shift_words(words: Sequence, timeline: Timeline, factory=None) -> List:
     """
     Move captions onto the cut timeline.
 
-    `factory(start, end, text)` builds whatever the caller's word type is, so
-    this module does not have to import the subtitle one. Words that fell
-    entirely inside a cut are dropped rather than stacked on the seam, which can
-    only happen when the caption words and the planning words disagree.
+    Words keep every field they arrived with, including any per-word styling a
+    caption editor attached, because the new word is a copy of the old one with
+    two numbers changed rather than a fresh one built from three of its fields.
+    An earlier version took a factory and called `factory(start, end, text)`,
+    which silently dropped anything else the word was carrying.
+
+    Words that fell entirely inside a cut are dropped rather than stacked on the
+    seam, which can only happen when the caption words and the planning words
+    disagree.
+
+    `factory` is accepted and ignored, so older callers keep working.
     """
+    from dataclasses import replace
+
     out = []
     for w in words:
         start, end = timeline.remap(w.start), timeline.remap(w.end)
         if end <= start and out:
             continue
-        out.append(factory(start, end, w.text))
+        out.append(replace(w, start=start, end=end))
     return out
 
 

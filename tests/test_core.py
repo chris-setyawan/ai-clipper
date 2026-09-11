@@ -171,3 +171,69 @@ def test_a_second_dry_run_keeps_the_clip_numbers(tmp_path):
     second = run(dry(tmp_path, transcript=settings.transcript, out=settings.out))
     assert first.numbers == second.numbers
     assert [c["start"] for c in first.preview] == [c["start"] for c in second.preview]
+
+
+# --- edits -------------------------------------------------------------------
+
+def test_edits_arrive_with_string_keys_and_are_coerced():
+    from ai_clipper.core import ClipEdit, as_edits
+    edits = as_edits({"3": {"gain_db": -2.0}})
+    assert edits[3] == ClipEdit(gain_db=-2.0)
+
+
+def test_an_empty_edit_has_no_fingerprint():
+    from ai_clipper.core import ClipEdit
+    assert ClipEdit().fingerprint() == ""
+    assert ClipEdit(gain_db=-2.0).fingerprint()
+
+
+def test_the_fingerprint_is_stable_and_tells_edits_apart():
+    from ai_clipper.core import ClipEdit
+    one = ClipEdit(keep_spans=[[0, 5]], gain_db=-2.0)
+    same = ClipEdit(keep_spans=[[0, 5]], gain_db=-2.0)
+    other = ClipEdit(keep_spans=[[0, 6]], gain_db=-2.0)
+    assert one.fingerprint() == same.fingerprint()
+    assert one.fingerprint() != other.fingerprint()
+
+
+def test_a_hand_set_boundary_wins(tmp_path):
+    settings = dry(tmp_path)
+    before = run(settings)
+    first = before.preview[0]
+
+    after = run(dry(tmp_path, transcript=settings.transcript, out=settings.out),
+                edits={first["clip"]: {"start": first["start"] + 2.0}})
+    moved = next(c for c in after.preview if c["clip"] == first["clip"])
+    assert moved["start"] == round(first["start"] + 2.0, 2)
+
+
+def test_a_trim_that_leaves_nothing_is_refused(tmp_path):
+    settings = dry(tmp_path)
+    first = run(settings).preview[0]
+    with pytest.raises(PipelineError):
+        run(dry(tmp_path, transcript=settings.transcript, out=settings.out),
+            edits={first["clip"]: {"start": first["start"],
+                                   "end": first["start"] + 0.2}})
+
+
+def test_trimming_is_reported(tmp_path):
+    settings = dry(tmp_path)
+    first = run(settings).preview[0]
+    seen = []
+    run(dry(tmp_path, transcript=settings.transcript, out=settings.out),
+        edits={first["clip"]: {"end": first["end"] - 2.0}},
+        on_progress=seen.append)
+    trimmed = [e for e in seen if e.kind == "trimmed"]
+    assert trimmed and first["clip"] in trimmed[0].data["clips"]
+
+
+def test_clips_nobody_edited_are_untouched(tmp_path):
+    settings = dry(tmp_path)
+    before = run(settings)
+    target = before.preview[0]["clip"]
+    after = run(dry(tmp_path, transcript=settings.transcript, out=settings.out),
+                edits={target: {"end": before.preview[0]["end"] - 1.0}})
+    for was, now in zip(before.preview, after.preview):
+        if now["clip"] == target:
+            continue
+        assert (was["start"], was["end"]) == (now["start"], now["end"])

@@ -400,6 +400,82 @@ and the session is written as each file lands, so running again picks up where
 it stopped. Measured on a three-clip render: stopped after two files, no
 `.part.mp4` left behind, and the next run encoded only the third.
 
+### Editing a clip
+
+`run()` takes a second argument: `edits`, clip number to a dict. It is how a
+person's changes get back in. Clips it does not name are untouched.
+
+```python
+run(settings, edits={2: {"start": 50.6,
+                         "keep_spans": [[50.6, 64.0], [68.0, 84.0]],
+                         "gain_db": -6.0,
+                         "words": [{"start": 51.0, "end": 51.4,
+                                    "text": "setiap",
+                                    "style": {"italic": True}}]}})
+```
+
+| field | what it does |
+|---|---|
+| `start`, `end` | move the clip's boundaries, in source time |
+| `keep_spans` | which ranges of the source survive, in order, absolute |
+| `gain_db` | this clip's volume instead of the episode-wide match |
+| `words` | replacement caption words, text and per-word styling together |
+
+Keys may be strings, which is what arrives over HTTP.
+
+Hand-set boundaries are applied after extension and opening adjustment, so a
+person's choice is the last word. A clip with `keep_spans` is left out of
+automatic dead air trimming entirely, because someone has already said which
+parts of it they want. A trim leaving less than a second raises `PipelineError`.
+
+Editing one clip re-renders one clip. Each rendered file records a short
+fingerprint of the edit it was made with alongside its boundaries, because a
+volume change and a restyled caption both leave start and end where they were.
+`run_report.json` gains an `edited` flag per output.
+
+### Per-word caption styling
+
+A `Word` carries its own overrides, and `edits[n]["words"]` is how a caption
+editor sends them:
+
+```python
+Word(3.2, 3.5, "setiap", {"italic": True, "color": "#39FF6A", "size": 96})
+```
+
+Known keys: `bold`, `italic`, `font`, `size`, `color`. Unknown keys are ignored.
+The styling is on the word rather than keyed by index because indexes move: word
+merging and dead air cuts both change them, and both are tested to carry the
+styling through.
+
+Style-wide, `CaptionStyle` gains `animation` (`none`, `pop`, `fade`, `rise`,
+`drop`, `zoom`, `blur`, `type`), `animation_ms`, `animation_travel`, and `glow`
+with `glow_color` and `glow_size`. All of them are ordinary style fields, so
+`styles.json` sets them like everything else.
+
+`glow_color` defaults to None, meaning the outline colour. A glow is drawn
+behind the fill and bleeds over its edges, so one the same colour as a word
+erases that word. Pick a colour that differs from both `primary` and
+`highlight`.
+
+### Previewing
+
+```python
+core.preview(video, start, end, "preview.mp4", words=words, edit=edit,
+             at=7.0, seconds=6.0, ratio="9:16", resolution="720p",
+             mode="crop", crop_path=None, platform="tiktok")
+```
+
+Takes plain numbers rather than a settings object and a clip number, because
+everything it needs is in `run_report.json`. Returns the path it wrote, and
+writes the `.ass` beside it.
+
+`at` and `seconds` are in clip time, not episode time. When the clip has pieces
+cut out of it, the requested window can come from two places in the source and
+is rendered from both. Encoded at `ultrafast` and crf 28: roughly 1.6s for a
+plain five-second preview, 3.0s for one that spans a cut.
+
+Asking for a moment past the end of the clip raises `PipelineError`.
+
 ### The pieces underneath
 
 `run()` is one way of wiring these together. A UI backend assembling its own is
@@ -417,6 +493,8 @@ a supported use rather than a workaround.
 | build subtitles | `video.subtitles.build_ass(words, w, h, style)` |
 | render one clip | `video.render.render_clip(src, start, end, out, spec, ass, crop_path)` |
 | cut pieces out of a clip | `render_clip(..., keep_spans=[(a, b), (c, d)])` |
+| a timeline from spans a person chose | `video.deadair.from_spans(spans, start, end)` |
+| the source behind a moment of a clip | `video.deadair.slice_of(timeline, a, b)` |
 | per-platform plans and margins | `export.platforms.plan_exports(...)`, `.style_for(style, key)` |
 | titles and hashtags | `export.caption_pack.build_pack(clip, index)` |
 
@@ -432,11 +510,12 @@ Listed so the first hour is not spent discovering them.
   of running a dry run first, which skips analysis entirely.
 - **One episode at a time.** No queue, no job ids. Two runs against the same
   output folder will fight over `session.json`.
-- **No preview render.** `render_clip` with a short range and
-  `preset="ultrafast"` is a few seconds, but nothing exposes it.
-- **No per-clip overrides.** `render_clip` already accepts `keep_spans` and a
-  per-clip audio filter, which is everything a manual trim-and-volume editor
-  needs, but `run()` decides both itself and takes no instruction from outside.
+- **No multi-track, transitions, background music or video effects.** Deliberate.
+  That is a different project, not a larger version of this one.
+- **No translation.** `--language` transcribes in any language Whisper knows;
+  subtitles in a different language than the audio would need a model.
+- **No typo correction beyond `lexicon.json`,** which is a list somebody wrote
+  by hand.
 - **`--regenerate` needs a previous run.** A reject button has to have run the
   pipeline at least once against that output folder first, or it raises
   `PipelineError` rather than picking something.

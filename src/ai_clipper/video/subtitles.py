@@ -84,6 +84,31 @@ class CaptionStyle:
     # what makes one style hold up at 720p and 1080p and in 9:16 and 1:1.
     title_chars_per_line: Optional[int] = None
 
+    # --- how a caption arrives -----------------------------------------------
+    # none, pop, fade, rise, drop, zoom, blur or type. Applied per caption
+    # event, which is per word, so the effect reads as the caption keeping time
+    # with the speaker rather than as a single entrance at the top of the clip.
+    animation: str = "none"
+    animation_ms: int = 150
+    # How far rise and drop travel, as a fraction of the font size. Expressed
+    # against the font rather than the frame so it stays proportionate when the
+    # same style is used at 720p and 1080p.
+    animation_travel: float = 0.6
+
+    # Glow is a blurred outline in its own colour, which is one event rather
+    # than a second copy of the text drawn underneath.
+    #
+    # None means the outline colour, and that is the default on purpose. A glow
+    # is drawn behind the fill and bleeds over its edges, so a glow the same
+    # colour as a word turns that word into a solid blob. The first version
+    # defaulted to the same green `punch` highlights with, and every highlighted
+    # word disappeared. Pick a colour that differs from both `primary` and
+    # `highlight`, or leave it alone for a soft dark halo that works under any
+    # fill.
+    glow: bool = False
+    glow_color: Optional[str] = None
+    glow_size: float = 6.0
+
     def scaled(self, height: int) -> "CaptionStyle":
         """
         Font sizes are authored against a 1920px-tall frame and scaled to the
@@ -99,6 +124,7 @@ class CaptionStyle:
         data["title_size"] = max(12, round(self.title_size * factor))
         data["outline"] = max(0.5, self.outline * factor)
         data["shadow"] = self.shadow * factor
+        data["glow_size"] = self.glow_size * factor
         return CaptionStyle.from_dict(data)
 
     def margins(self) -> tuple:
@@ -175,9 +201,26 @@ def load_styles(path: Optional[str] = None) -> dict:
 
 @dataclass
 class Word:
+    """
+    One spoken word, and optionally how this one word should look.
+
+    `style` is what a caption editor writes: a dict of overrides that apply to
+    this word alone. It lives on the word rather than in a separate table keyed
+    by position, because positions move. Words get merged when Whisper splits a
+    number, and they get shifted when dead air is cut, and an index into the
+    original list stops meaning anything after either. Carried on the word, the
+    styling survives both.
+
+        Word(3.2, 3.5, "setiap", {"italic": True, "color": "#39FF6A"})
+
+    Known keys: bold, italic, font, size, color. Anything else is ignored, so a
+    file written by a newer editor still renders in an older build.
+    """
+
     start: float
     end: float
     text: str
+    style: Optional[dict] = None
 
 
 @dataclass
@@ -219,7 +262,8 @@ def merge_split_tokens(words: List[Word]) -> List[Word]:
             or not any(ch.isalnum() for ch in text)
         ):
             previous = out[-1]
-            out[-1] = Word(previous.start, w.end, previous.text.strip() + text)
+            out[-1] = Word(previous.start, w.end, previous.text.strip() + text,
+                           previous.style)
             continue
         out.append(w)
     return out
@@ -326,6 +370,126 @@ def title_event(text: str, style: CaptionStyle, width: int, height: int) -> str:
     )
 
 
+
+ANIMATIONS = ("none", "pop", "fade", "rise", "drop", "zoom", "blur", "type")
+
+# rise and drop are the two that move, and moving in ASS needs a point to move
+# between, which means the caption has to be positioned explicitly rather than
+# laid out from its margins.
+MOVING = ("rise", "drop")
+
+
+def word_tags(word_style: Optional[dict], style: CaptionStyle) -> tuple:
+    """
+    (opening, closing) override tags for one word, or ("", "") for a plain one.
+
+    Every override is closed again immediately, because a caption event holds
+    the whole chunk and an unclosed tag would leak onto the words after it.
+    Unknown keys are ignored so a file written by a newer caption editor still
+    renders here, minus whatever this build has never heard of.
+    """
+    if not word_style:
+        return "", ""
+
+    opening, closing = [], []
+    if word_style.get("bold") is not None:
+        opening.append(r"\b1" if word_style["bold"] else r"\b0")
+        closing.append(r"\b1" if style.bold else r"\b0")
+    if word_style.get("italic"):
+        opening.append(r"\i1")
+        closing.append(r"\i0")
+    if word_style.get("font"):
+        opening.append(r"\fn" + str(word_style["font"]))
+        closing.append(r"\fn" + style.font)
+    if word_style.get("size"):
+        opening.append(r"\fs" + str(int(word_style["size"])))
+        closing.append(r"\fs" + str(style.font_size))
+    if word_style.get("color"):
+        opening.append(r"\c" + ass_color(str(word_style["color"])))
+        closing.append(r"\c" + ass_color(style.primary))
+
+    if not opening:
+        return "", ""
+    return "{" + "".join(opening) + "}", "{" + "".join(closing) + "}"
+
+
+def entrance(style: CaptionStyle, anchor: Optional[tuple] = None) -> str:
+    """
+    The tag that gives a caption its way of arriving.
+
+    `anchor` is (x, y) and is only needed by the animations that move. Anything
+    that merely scales, fades or blurs is a transform on the text where it
+    already sits, and forcing a position on those would quietly change how
+    multi-line captions wrap.
+    """
+    ms = max(1, int(style.animation_ms))
+    kind = style.animation
+
+    if kind == "pop":
+        return r"{\fscx60\fscy60\t(0," + str(ms) + r",\fscx100\fscy100)}"
+    if kind == "zoom":
+        return r"{\fscx130\fscy130\t(0," + str(ms) + r",\fscx100\fscy100)}"
+    if kind == "fade":
+        return r"{\fad(" + str(ms) + r",0)}"
+    if kind == "blur":
+        return (r"{\blur" + f"{style.font_size * 0.12:.1f}"
+                + r"\t(0," + str(ms) + r",\blur0)}")
+    if kind in MOVING and anchor:
+        x, y = anchor
+        travel = max(2, int(style.font_size * style.animation_travel))
+        from_y = y + travel if kind == "rise" else y - travel
+        return (r"{\move(" + f"{x},{from_y},{x},{y},0,{ms}"
+                + r")\fad(" + str(ms) + r",0)}")
+    return ""
+
+
+def glow_tag(style: CaptionStyle) -> str:
+    """
+    A blurred outline in the glow colour.
+
+    One event, not two. The obvious way to glow is to draw the text twice, once
+    fat and blurred underneath and once sharp on top, and it doubles the event
+    count for a result libass already gives for free: blur applies to the
+    border, so a wide border plus blur is a halo.
+    """
+    if not style.glow:
+        return ""
+    return (r"{\bord" + f"{max(style.outline, style.glow_size):.1f}"
+            + r"\blur" + f"{style.glow_size:.1f}"
+            + r"\3c" + ass_color(style.glow_color or style.outline_color) + "}")
+
+
+def typed(text: str, start: float, end: float, ms: int, prefix: str,
+          style_name: str = "Cap") -> List[str]:
+    """
+    A caption that types itself in, one character at a time.
+
+    Six of the seven animations are a tag on an event. This one is not: ASS has
+    no reveal transform, so a typewriter is a run of events each showing one
+    character more than the last. The reveal is capped at `ms` no matter how
+    long the line is, so a long chunk types faster rather than running past the
+    words being spoken.
+    """
+    letters = [i for i, ch in enumerate(text) if not ch.isspace()]
+    if not letters:
+        return []
+
+    span = min(ms / 1000.0, max(0.0, end - start))
+    step = span / len(letters) if letters else 0.0
+
+    events = []
+    for n, cut in enumerate(letters):
+        at = start + step * n
+        until = start + step * (n + 1) if n < len(letters) - 1 else end
+        if until <= at:
+            continue
+        events.append(
+            f"Dialogue: 0,{ass_time(at)},{ass_time(until)},{style_name},,0,0,0,,"
+            + prefix + text[: cut + 1]
+        )
+    return events
+
+
 def build_ass(
     words: List[Word],
     width: int,
@@ -346,7 +510,8 @@ def build_ass(
     style = (style or PRESETS["clean"]).scaled(height)
 
     joined = merge_split_tokens(words)
-    shifted = [Word(w.start - clip_start, w.end - clip_start, w.text) for w in joined]
+    shifted = [Word(w.start - clip_start, w.end - clip_start, w.text, w.style)
+               for w in joined]
     chunks = chunk_words(shifted, style.words_per_chunk)
 
     margin_v = int(height * style.bottom_margin_frac)
@@ -374,6 +539,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     highlight = ass_color(style.highlight)
     primary = ass_color(style.primary)
 
+    # Where the caption block sits, needed only by the animations that move.
+    # Alignment 2 anchors at the bottom centre, so this is the same point the
+    # margins would have put it at.
+    anchor = (width // 2, height - margin_v) if style.animation in MOVING else None
+    prefix = glow_tag(style) + entrance(style, anchor)
+
     lines = []
     # Layer 1, and first in the file: the title is drawn over the captions in
     # the rare case where a long one reaches down into them.
@@ -387,17 +558,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             parts = []
             for j, w in enumerate(chunk.words):
                 text = w.text.upper() if style.uppercase else w.text
+                opening, closing = word_tags(w.style, style)
                 if j == i:
-                    parts.append(r"{\c" + highlight + "}" + text + r"{\c" + primary + "}")
-                else:
-                    parts.append(text)
+                    text = r"{\c" + highlight + "}" + text + r"{\c" + primary + "}"
+                parts.append(opening + text + closing)
             body = " ".join(parts)
 
             # hold the last word of a chunk until the chunk ends, so the caption
             # does not blink out early on a trailing pause
             end = active.end if i < len(chunk.words) - 1 else chunk.end
+
+            if style.animation == "type":
+                # One event per character, so this one cannot share the path
+                # the other six take. Only the first word of a chunk types; the
+                # rest of the chunk is already on screen by then.
+                if i == 0:
+                    lines.extend(typed(body, active.start, end,
+                                       style.animation_ms, prefix))
+                else:
+                    lines.append(
+                        f"Dialogue: 0,{ass_time(active.start)},{ass_time(end)},"
+                        f"Cap,,0,0,0,,{prefix}{body}"
+                    )
+                continue
+
             lines.append(
-                f"Dialogue: 0,{ass_time(active.start)},{ass_time(end)},Cap,,0,0,0,,{body}"
+                f"Dialogue: 0,{ass_time(active.start)},{ass_time(end)},Cap,,0,0,0,,"
+                f"{prefix}{body}"
             )
 
     return header + "\n".join(lines) + "\n"

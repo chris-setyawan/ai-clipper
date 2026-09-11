@@ -127,3 +127,56 @@ def test_each_kept_span_becomes_its_own_piece():
     spec = RenderSpec(mode="crop")
     runs = plan_runs(None, spec, [(0.0, 5.0), (8.6, 20.0)])
     assert runs == [(0.0, 5.0, "crop"), (8.6, 20.0, "crop")]
+
+
+# --- spans someone else chose ------------------------------------------------
+
+def test_spans_from_an_editor_become_a_timeline():
+    line = deadair.from_spans([[10, 20], [30, 40]], 10, 40)
+    assert line.ranges() == [(10.0, 20.0), (30.0, 40.0)]
+    assert line.duration == 20.0
+    assert line.removed == 10.0
+
+
+def test_spans_are_clamped_to_the_clip_and_ordered():
+    """A UI should not be able to hand back something that renders backwards."""
+    line = deadair.from_spans([[35, 50], [5, 20]], 10, 40)
+    assert line.ranges() == [(10.0, 20.0), (35.0, 40.0)]
+
+
+def test_spans_that_keep_nothing_fall_back_to_the_whole_clip():
+    assert deadair.from_spans([[0, 0]], 10, 40).ranges() == [(10.0, 40.0)]
+    assert deadair.from_spans([], 10, 40).ranges() == [(10.0, 40.0)]
+
+
+def test_slicing_finds_the_source_behind_a_moment_of_the_clip():
+    line = deadair.from_spans([[10, 20], [30, 40]], 10, 40)
+    assert deadair.slice_of(line, 0, 5) == [(10.0, 15.0)]
+    assert deadair.slice_of(line, 12, 20) == [(32.0, 40.0)]
+
+
+def test_a_slice_across_a_cut_comes_back_in_two_pieces():
+    """
+    Six seconds starting eight seconds in can come from two places in the
+    episode, and a preview has to be given both.
+    """
+    line = deadair.from_spans([[10, 20], [30, 40]], 10, 40)
+    assert deadair.slice_of(line, 8, 13) == [(18.0, 20.0), (30.0, 33.0)]
+
+
+def test_a_slice_past_the_end_is_empty():
+    line = deadair.from_spans([[10, 20]], 10, 20)
+    assert deadair.slice_of(line, 50, 60) == []
+
+
+def test_shifted_words_keep_their_other_fields():
+    @dataclass
+    class Styled:
+        start: float
+        end: float
+        text: str
+        style: dict = None
+
+    words = [Styled(0.0, 1.0, "satu", {"italic": True}), Styled(9.0, 10.0, "dua")]
+    line = deadair.plan(words, 0, 10)
+    assert deadair.shift_words(words, line)[0].style == {"italic": True}

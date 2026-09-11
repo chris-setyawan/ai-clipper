@@ -482,6 +482,112 @@ it is the same trade-off as the captions themselves: `punch` puts two words on
 screen at a time and makes a punchy, sparse thumbnail, `calm` puts five and
 gives it a full line to read.
 
+## Caption styling, per word
+
+The karaoke highlight was the only thing a caption could say about one word.
+Everything else - the font, the size, whether it leans - belonged to the whole
+style. That is enough for a preset and not enough for anyone who wants a line to
+read the way a clipper would set it, where one word in a phrase is doing the
+work and looks like it.
+
+So a `Word` can carry its own overrides:
+
+```python
+Word(3.2, 3.5, "setiap", {"italic": True, "color": "#39FF6A", "size": 96})
+```
+
+Known keys are bold, italic, font, size and color. Anything else is ignored, so
+a file written by a newer caption editor still renders in an older build.
+
+Two details that a position-keyed version would have got wrong. The styling
+lives on the word rather than in a table keyed by index, because indexes move:
+Whisper splits "19.000" into two tokens that get rejoined, and cutting dead air
+shifts every word after the cut. Carried on the word, the styling survives both,
+and there is a test for each. And every override is closed again immediately,
+because a caption event holds the whole chunk and a tag left open leaks onto the
+words after it.
+
+## Animations and glow
+
+Seven ways for a caption to arrive, set per style: `pop`, `fade`, `rise`,
+`drop`, `zoom`, `blur`, `type`. They are applied per caption event, which is per
+word, so the effect reads as the caption keeping time with the speaker rather
+than as one entrance at the top of the clip.
+
+Six of them are a tag on the event. `type` is not: ASS has no reveal transform,
+so a typewriter is a run of events each showing one character more than the
+last. The reveal is capped, so a long line types faster rather than still
+appearing after the speaker has moved on.
+
+`rise` and `drop` are the only two that need explicit coordinates, because
+moving in ASS means moving between two points. Asking for one of the other five
+never pins the caption, since forcing a position changes how a long caption
+wraps, and there is a test that checks the four that scale or fade leave the
+position alone.
+
+Glow is a blurred outline in its own colour: one event, not two. The obvious way
+to glow is to draw the text twice, once fat and blurred underneath and once
+sharp on top, and it doubles the event count for something libass gives for
+free.
+
+One thing that had to be seen to be found. Glow defaulted to the same green
+`punch` highlights with, and in the first render every highlighted word came out
+as a solid green blob: a glow is drawn behind the fill and bleeds over its
+edges, so a glow the colour of a word erases that word. The default is now the
+outline colour, a soft dark halo that works under any fill, and a coloured glow
+is a choice you make knowing it has to differ from both `primary` and
+`highlight`.
+
+## Editing a clip by hand
+
+Automatic choices are a starting point. Someone watching the output will want to
+move a boundary, cut a patch out of the middle, turn one clip down, or fix a
+word. All of that now goes back in through `edits`, keyed by clip number:
+
+```python
+run(settings, edits={2: {"start": 50.6,
+                         "keep_spans": [[50.6, 64.0], [68.0, 84.0]],
+                         "gain_db": -6.0,
+                         "words": [...]}})
+```
+
+The interesting part is how little of this was new. Trimming is a different
+start and end. Cutting a patch out of the middle is exactly the mechanism dead
+air removal was built on, and `render_clip` has taken `keep_spans` since then. A
+per-clip volume is the audio filter the loudness step already sets. What was
+missing was not the ability, it was a way to say so from outside.
+
+Hand-set boundaries are applied after extension and opening adjustment, so a
+person's choice is the last word rather than something the topic model gets to
+move again. A clip with hand-cut spans is left out of automatic trimming
+entirely, because someone has already said which parts of it they want.
+
+Editing one clip re-renders one clip. That needed a change: boundaries alone
+stopped being enough to tell whether a file was current the moment someone could
+change a clip without moving its ends, since a volume change and a restyled
+caption both leave start and end exactly where they were. Each rendered file now
+records a short fingerprint of the edit it was made with, per clip rather than
+per run. Measured on a three-clip render: editing clip 2 re-encoded clip 2, and
+running again with the same edits encoded nothing.
+
+## Previewing before committing
+
+```python
+core.preview(video, start, end, "preview.mp4", words=words, edit=edit,
+             at=7.0, seconds=6.0)
+```
+
+Deliberately takes plain numbers rather than a settings object and a clip
+number, because everything it needs is already in `run_report.json`. A UI that
+has just shown someone a clip can call this without the pipeline re-deriving a
+selection it already made.
+
+`at` and `seconds` are in clip time, which is what a person is looking at: the
+bit six seconds in means six seconds into the clip, not into the episode. When
+the clip has pieces cut out of it those six seconds can come from two places in
+the source, and they do. Measured: 1.6s for a plain five-second preview, 3.0s
+for one that spans a cut.
+
 ## Regenerating clips
 
 The scorer keeps its whole ranked pool, not just the clips it picked, so
@@ -773,7 +879,7 @@ data/
   sample_transcript.json   synthetic transcript for scorer tests
 docs/framing.png       the before-and-after figure at the top of this file
 docs/interface.md      commands, output files and their JSON, for building against it
-tests/                 250 tests, no video or model files needed
+tests/                 284 tests, no video or model files needed
 
 run_pipeline.py        the pipeline, from a clone
 transcribe_local.py    transcription, from a clone or from beside the video
